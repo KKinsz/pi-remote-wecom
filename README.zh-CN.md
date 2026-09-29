@@ -19,13 +19,13 @@
 
 需要 **macOS、Node.js ≥22.19、Pi Coding Agent**（已验证 0.87.1），以及一个专用的企微智能机器人。
 
-直接从[公开 Git 仓库](https://github.com/KKinsz/pi-remote-wecom)安装，暂未发布 npm：
+暂未发布 npm，可从本仓库的 Git 地址安装（替换为实际仓库地址）：
 
 ```sh
-pi install git:github.com/KKinsz/pi-remote-wecom
+pi install git:<本仓库 Git 地址>
 ```
 
-也可使用源码安装，在仓库目录中执行：
+也可在仓库目录中直接源码安装：
 
 ```sh
 npm ci --ignore-scripts

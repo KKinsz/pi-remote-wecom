@@ -19,10 +19,10 @@ Control your local [Pi coding agent](https://pi.dev) from WeCom on your phone. O
 
 Requires **macOS, Node.js ≥22.19, Pi Coding Agent** (tested with 0.87.1), and a dedicated WeCom intelligent bot with **API mode → persistent connection** enabled. A regular group webhook bot is not sufficient. Feature availability depends on your enterprise; use with external enterprise accounts has not been separately verified.
 
-Install directly from the [public Git repository](https://github.com/KKinsz/pi-remote-wecom). An npm release is not available yet:
+An npm release is not available yet. Install from this repository's Git URL (substitute the actual repository address):
 
 ```sh
-pi install git:github.com/KKinsz/pi-remote-wecom
+pi install git:<repository-git-url>
 ```
 
 Alternatively, install from a source checkout:
