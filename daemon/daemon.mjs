@@ -42,6 +42,7 @@ const EMPH_NAME_MAX = 16;
 const POLL_HOLD_MS = 25000;
 const MODEL_ACK_MS = 10000;
 const MODEL_LIST_MAX = 60;
+const MODEL_ALL_MAX = 500;
 const TUI_STALE_MS = 35000;
 // Keep completed results inline until they approach WeCom's 20,480-byte
 // Markdown limit. The transport sends each message up to the same 20,000-byte
@@ -346,6 +347,8 @@ class Target {
         this.model = "";
         this.modelProvider = "";
         this.models = [];
+        this.allModels = [];
+        this.modelScoped = false;
         this.ctxPercent = null;
         this.contextWindow = null;
         this.lastActivity = Date.now();
@@ -648,9 +651,12 @@ class RpcTarget extends Target {
             log(`rpc[${this.key}] get_state 失败（模型名省略）：${e?.message || e}`);
         }
     }
+    // { models: 默认卡片（scope 优先）, all: 关键词检索范围（全部已认证模型）, scoped: 是否命中 scope }
     async listModels() {
         const r = await this.cmd("get_available_models", {}, 15000);
-        return scopeModels((r.data?.models || []).map(modelInfo).filter(Boolean));
+        const all = (r.data?.models || []).map(modelInfo).filter(Boolean);
+        const scoped = scopeModels(all);
+        return { models: scoped || all, all, scoped: !!scoped };
     }
     async setModel(m) {
         const r = await this.cmd("set_model", { provider: m.provider, modelId: m.id }, 30000);
@@ -711,7 +717,9 @@ class TuiTarget extends Target {
         return m;
     }
     async listModels() {
-        return this.models;
+        // 旧版扩展只上报 models：检索范围退回同一列表。
+        const all = this.allModels.length ? this.allModels : this.models;
+        return { models: this.models.length ? this.models : all, all, scoped: this.modelScoped };
     }
     setModel(m) {
         if (!this.alive)
@@ -1464,10 +1472,11 @@ function enabledModelPatterns() {
         return [];
     }
 }
+// 返回 enabledModels 命中的模型；未配置或一个都没命中时返回 null（调用方退回全部）。
 function scopeModels(models) {
     const pats = enabledModelPatterns();
     if (!pats.length)
-        return models;
+        return null;
     const out = [];
     for (const raw of pats) {
         const pat = raw.replace(/:(off|minimal|low|medium|high|xhigh|max)$/, "");
@@ -1478,7 +1487,7 @@ function scopeModels(models) {
                 out.push(m);
         }
     }
-    return out.length ? out : models;
+    return out.length ? out : null;
 }
 const isCurrentModel = (t, m) => m.id === t.model && (!t.modelProvider || m.provider === t.modelProvider);
 function modelMatches(models, find) {
@@ -1491,25 +1500,26 @@ function modelMatches(models, find) {
     return models.filter((m) => hayMatch(`${modelKey(m)} ${m.name || ""}`.toLowerCase(), terms));
 }
 async function buildModelCard(t, find = "") {
-    let models;
+    let models, all, scoped;
     try {
-        models = await t.listModels();
+        ({ models, all, scoped } = await t.listModels());
     }
     catch (e) {
         return plainText({ head: "⚠️ 读取模型失败", body: String(e?.message || e).slice(0, 120), foot: "稍后重试，或发送 `状态` 查看" });
     }
-    if (!models?.length) {
+    if (!models?.length && !all?.length) {
         return plainText({
             head: "⚠️ 没有可选模型",
             body: t.kind === "tui" ? "终端还没上报模型列表，可能需要在电脑上 /reload 更新扩展。" : "这个会话没有配置好认证的模型。",
             foot: "在电脑上执行 /login 或 /model 配置",
         });
     }
-    const hits = modelMatches(models, find);
+    // 无关键词展示 scope；有关键词在全部已认证模型里检索。
+    const hits = find ? modelMatches(all, find) : models;
     if (find && !hits.length) {
         return plainText({
             head: `🔍 没有匹配的模型 · “${clip(find, 16)}”`,
-            body: `可选 ${models.length} 个，没有找到包含该关键词的模型。`,
+            body: `共 ${all.length} 个已认证模型，没有找到包含该关键词的模型。`,
             foot: "发送 `切换模型` 查看全部",
         });
     }
@@ -1524,7 +1534,7 @@ async function buildModelCard(t, find = "") {
     const card = {
         card_type: "vote_interaction",
         title: clip(`💡 切换模型 · ${t.label()}`, 26),
-        desc: find ? `找到 ${hits.length} 个${more}` : `可选 ${hits.length} 个${more} · 发「切换模型 关键词」筛选`,
+        desc: find ? `找到 ${hits.length} 个${more}` : `可选 ${hits.length} 个${more} · 发「切换模型 关键词」筛选${scoped ? "所有模型" : ""}`,
         options,
         mode: 0,
         submit_text: "切换模型",
@@ -1574,7 +1584,7 @@ async function handleModelPick(pick) {
         t = [...targets.values()].find((x) => x.sessionId && x.sessionId === pick.sessionId && x.kind !== "history" && !x.closed);
     if (!t || (t.kind === "tui" && !t.alive))
         return plainText({ head: "⚠️ 切换模型失败", body: "会话已关闭", foot: "发送 `活跃会话` 重新选择会话" });
-    const models = await t.listModels().catch(() => []);
+    const { all: models = [] } = await t.listModels().catch(() => ({}));
     const m = models.find((x) => x.provider === pick.provider && x.id === pick.modelId) || { provider: pick.provider, id: pick.modelId };
     return applyModel(t, m);
 }
@@ -2035,6 +2045,10 @@ async function handleHttp(req, res) {
             t.modelProvider = String(o.modelProvider);
         if (Array.isArray(o.models))
             t.models = o.models.slice(0, MODEL_LIST_MAX).map(modelInfo).filter(Boolean);
+        if (Array.isArray(o.allModels))
+            t.allModels = o.allModels.slice(0, MODEL_ALL_MAX).map(modelInfo).filter(Boolean);
+        if (typeof o.modelScoped === "boolean")
+            t.modelScoped = o.modelScoped;
         if (Object.hasOwn(o, "ctxPercent"))
             t.ctxPercent = typeof o.ctxPercent === "number" && Number.isFinite(o.ctxPercent) && o.ctxPercent >= 0 ? o.ctxPercent : null;
         if (o.contextWindow > 0)

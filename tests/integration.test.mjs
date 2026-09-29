@@ -172,6 +172,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const modelCard=(await api('/command',{text:'model'})).reply.card;
   assert.equal(modelCard.card_type,'vote_interaction');
   assert.deepEqual(modelCard.options.map(o=>o.text),['synthetic-model · syn · ← 当前','Synthetic Fast · syn']);
+  assert.match(modelCard.desc,/可选 2 个 · 发「切换模型 关键词」筛选所有模型/);
   message('model'); const nativeModel=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('切换模型')&&x.template_card.checkbox).at(-1)?.template_card);
   socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:nativeModel.task_id,selected_items:{selected_item:[{question_key:nativeModel.task_id,option_ids:{option_id:[nativeModel.checkbox.option_list[1].id]}}]}}}}}));
   const switched=await until(()=>sent.find(x=>x.template_card?.card_type==='text_notice'&&x.template_card.main_title.title.includes('切换模型'))?.template_card);
@@ -180,13 +181,18 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const direct=await api('/command',{text:'切换模型 synthetic-model'});
   assert.equal(direct.reply.card.emphasis_content.title,'synthetic-model');
   assert.match((await api('/command',{text:'model 不存在'})).reply,/没有匹配的模型/);
+  // Keyword search covers all authenticated models, beyond the enabledModels scope.
+  assert.equal((await api('/command',{text:'model hidden'})).reply.card.emphasis_content.title,'hidden-model');
   // TUI: models come from registration; switch is delivered through poll and confirmed by /model-ack.
-  await api('/register',{mode:'tui',sessionId:'A',sessionName:'会话A',cwd:dir,model:'m1',modelProvider:'p',models:[{provider:'p',id:'m1'},{provider:'p',id:'m2'}]});
+  await api('/register',{mode:'tui',sessionId:'A',sessionName:'会话A',cwd:dir,model:'m1',modelProvider:'p',models:[{provider:'p',id:'m1'},{provider:'p',id:'m2'}],allModels:[{provider:'p',id:'m1'},{provider:'p',id:'m2'},{provider:'q',id:'m3-extra'}],modelScoped:true});
   await api('/command',{text:'ls'}); const liveCard=(await api('/command',{text:'ls'})).reply.card;
   const aIndex=liveCard.options.findIndex(o=>o.text.includes('会话A'))+1;
   await api('/command',{text:`选择会话 ${aIndex}`});
   const tuiCard=(await api('/command',{text:'model'})).reply.card;
   assert.deepEqual(tuiCard.options.map(o=>o.text),['m1 · p · ← 当前','m2 · p']);
+  assert.match(tuiCard.desc,/筛选所有模型/);
+  const tuiSearch=(await api('/command',{text:'model m'})).reply.card;
+  assert.deepEqual(tuiSearch.options.map(o=>o.text),['m1 · p · ← 当前','m2 · p','m3-extra · q']);
   const pending=api('/command',{text:'model m2'});
   const ask=await until(async()=>{const r=await api(`/poll?key=${a.key}`); return r.messages?.find(m=>m.type==='set_model');});
   assert.equal(ask.modelId,'m2');

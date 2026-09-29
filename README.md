@@ -56,7 +56,7 @@ On your phone, select a session and send a message to continue it.
 | `h [keywords]` | Search and resume session history |
 | `n [directory] [message]` | Create a terminal session |
 | `nb [directory] [message]` | Create a background RPC session |
-| `model [keywords]` | Switch the current session's model |
+| `model [keywords]` | Switch the current session's model; the list follows your scope (enabledModels), keywords search all authenticated models |
 | `status` | Show the current session's status |
 | `stop` | Interrupt the current task |
 | `help` | Show all commands |

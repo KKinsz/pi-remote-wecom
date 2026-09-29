@@ -14,13 +14,18 @@ function meta(ctx: ExtensionContext) {
   const usage = ctx.getContextUsage();
   return {model: ctx.model?.id || '', modelProvider: ctx.model?.provider || '', ctxPercent: usage?.percent ?? null, contextWindow: usage?.contextWindow ?? ctx.model?.contextWindow ?? null};
 }
-// Same candidate set as Ctrl+P: scoped models (enabledModels / --models) when configured, else all authenticated models.
+const modelBrief = (m: any) => ({provider: m.provider, id: m.id, name: m.name || '', contextWindow: m.contextWindow || 0});
+// Default card = Ctrl+P candidates (scoped models via enabledModels / --models, else all authenticated models);
+// keyword search covers every authenticated model, so a scope never hides a model from the phone.
 function selectableModels(ctx: ExtensionContext) {
-  let list: any[] = [];
-  try {
-    list = ctx.scopedModels?.length ? ctx.scopedModels.map(s => s.model) : ctx.modelRegistry.getAvailable();
-  } catch {list = [];}
-  return list.slice(0, 60).map(m => ({provider: m.provider, id: m.id, name: m.name || '', contextWindow: m.contextWindow || 0}));
+  let all: any[] = []; let scoped: any[] = [];
+  try {all = ctx.modelRegistry.getAvailable();} catch {all = [];}
+  try {scoped = ctx.scopedModels?.length ? ctx.scopedModels.map(s => s.model) : [];} catch {scoped = [];}
+  return {
+    models: (scoped.length ? scoped : all).slice(0, 60).map(modelBrief),
+    allModels: all.slice(0, 500).map(modelBrief),
+    modelScoped: scoped.length > 0,
+  };
 }
 // Footer status: Nerd Font phone glyph (U+F10B, monochrome so it can be colored; 📱 falls back to a
 // color-emoji block) tinted by state, label in the pill's normal text color. Label color is restored
@@ -64,7 +69,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   const registration = (r: Runtime, origin = '') => ({
     sessionFile: r.ctx.sessionManager.getSessionFile() || '',
     sessionId: r.ctx.sessionManager.getSessionId(), sessionName: pi.getSessionName() || '',
-    cwd: r.ctx.cwd, pid: process.pid, mode: 'tui', origin, ...meta(r.ctx), models: selectableModels(r.ctx),
+    cwd: r.ctx.cwd, pid: process.pid, mode: 'tui', origin, ...meta(r.ctx), ...selectableModels(r.ctx),
     // Lets the daemon skip waiting for a session name that will never come.
     ...(opts.autoName ? {autoName: opts.autoName()} : {}),
   });
