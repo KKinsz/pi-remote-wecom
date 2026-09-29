@@ -14,7 +14,6 @@ Control your local [Pi coding agent](https://pi.dev) from WeCom on your phone. O
 | Commands | Sessions | New session | Switch models | Task results |
 | --- | --- | --- | --- | --- |
 | <a href="docs/images/commands.png"><img src="docs/images/commands.png" width="180" alt="Commands"></a> | <a href="docs/images/sessions.png"><img src="docs/images/sessions.png" width="180" alt="Sessions"></a> | <a href="docs/images/create-session.png"><img src="docs/images/create-session.png" width="180" alt="New session"></a> | <a href="docs/images/switch-model.png"><img src="docs/images/switch-model.png" width="180" alt="Switch models"></a> | <a href="docs/images/task-result.png"><img src="docs/images/task-result.png" width="180" alt="Task results"></a> |
-| Use Chinese commands or short aliases. | Select active sessions or browse history. | Start a session and receive its results. | Change the current model from a card. | Send a task and receive completion updates. |
 
 ## Install
 
