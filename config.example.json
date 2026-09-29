@@ -5,6 +5,8 @@
   "localPort": 18778,
   "terminal": "auto",
   "tabTitleEnabled": true,
+  "remoteConfirm": "ask-then-allow",
+  "remoteConfirmTimeoutMs": 180000,
   "nameWaitMs": 3000,
   "kittySocket": "",
   "tmuxSession": "pi"

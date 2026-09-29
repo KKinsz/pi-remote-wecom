@@ -21,7 +21,6 @@ const HOME = os.homedir();
 const DIR = RUN_DIR;
 const CODE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LOG_FILE = path.join(DIR, "bridge.log");
-const GUARD_EXT = path.join(CODE_DIR, "readonly-guard.ts");
 const CURRENT_FILE = path.join(DIR, ".current");
 const SESSIONS_ROOT = path.join(CFG.agentDir, "sessions");
 const OUT_DIR = path.join(DIR, "out");
@@ -43,6 +42,10 @@ const POLL_HOLD_MS = 25000;
 const MODEL_ACK_MS = 10000;
 const MODEL_LIST_MAX = 60;
 const MODEL_ALL_MAX = 500;
+// 手机发起的任务里，扩展弹窗转企微卡片；confirm 超时策略见 remoteConfirm。
+const UI_POLICY = CFG.remoteConfirm;
+const UI_TIMEOUT_MS = CFG.remoteConfirmTimeoutMs;
+const UI_TEXT_MAX_BYTES = 1200;
 const TUI_STALE_MS = 35000;
 // Keep completed results inline until they approach WeCom's 20,480-byte
 // Markdown limit. The transport sends each message up to the same 20,000-byte
@@ -301,7 +304,6 @@ class Run {
         this.toolErrors = 0;
         this.lastTool = "";
         this.lastOutputAt = Date.now();
-        this.blocks = [];
         this.error = null;
         this.aborted = null;
         this.local = false;
@@ -423,18 +425,19 @@ class RpcTarget extends Target {
         this.idSeq = 0;
         this.pendingCmds = new Map();
         this.buf = Buffer.alloc(0);
+        this.starting = false;
     }
     async start({ sessionFile } = {}) {
-        const args = ["--mode", "rpc", "--offline", "--no-extensions", "--exclude-tools", "write,edit"];
-        if (fs.existsSync(GUARD_EXT))
-            args.push("--extension", GUARD_EXT);
+        this.starting = true;
+        // 与终端会话能力一致：加载用户扩展、不限制工具；--offline 仅跳过启动时的模型目录刷新。
+        const args = ["--mode", "rpc", "--offline"];
         if (sessionFile)
             args.push("--session", sessionFile);
         if (this.name && !sessionFile)
             args.push("--name", this.name);
         this.proc = spawn(CFG.piBin, args, {
             cwd: this.cwd,
-            env: { ...process.env, PI_CODING_AGENT_DIR: CFG.agentDir, PI_REMOTE_READONLY: "1" },
+            env: { ...process.env, PI_CODING_AGENT_DIR: CFG.agentDir },
             stdio: ["pipe", "pipe", "pipe"],
         });
         this.proc.stdout.on("data", (c) => this._onStdout(c));
@@ -451,6 +454,7 @@ class RpcTarget extends Target {
                 p.reject(new Error("无法启动 pi，请检查 piBin 与 PATH"));
             }
             this.pendingCmds.clear();
+            dropUiPrompts(this);
             targets.delete(this.key);
         });
         this.proc.on("exit", (code, sig) => {
@@ -467,9 +471,16 @@ class RpcTarget extends Target {
                 this.run.error = `pi 进程退出 (code=${code})`;
                 this.run.settle();
             }
+            dropUiPrompts(this);
             targets.delete(this.key);
         });
-        const st = await this.cmd("get_state", {}, 30000);
+        let st;
+        try {
+            st = await this.cmd("get_state", {}, 30000);
+        }
+        finally {
+            this.starting = false;
+        }
         if (st && st.data) {
             this.sessionFile = st.data.sessionFile || this.sessionFile;
             this.sessionId = st.data.sessionId || this.sessionId;
@@ -517,10 +528,14 @@ class RpcTarget extends Target {
             return;
         }
         if (rec.type === "extension_ui_request") {
-            if (rec.method === "notify" && typeof rec.message === "string" && rec.message.includes("已阻止")) {
-                if (this.run)
-                    this.run.blocks.push(rec.message);
-                log(`rpc[${this.key}] BLOCKED ${rec.message.replace(/\n/g, " ").slice(0, 160)}`);
+            // Pi 在加载完扩展（session_start）后才读 stdin：启动期的阻塞弹窗无法回答，直接失败并说明原因。
+            if (this.starting && UI_KINDS.has(rec.method)) {
+                this.failStart(`扩展在启动时请求${rec.method === "confirm" ? "确认" : "输入"}（${clip(stripCtrl(String(rec.title || "")), 40)}），后台会话无法处理，请改用终端会话`);
+                return;
+            }
+            // 后台会话只由手机驱动：所有阻塞弹窗都转到手机（其余 fire-and-forget 忽略）。
+            if (UI_KINDS.has(rec.method) && typeof rec.id === "string") {
+                openUiPrompt(this, { reqId: rec.id, kind: rec.method, title: rec.title, message: rec.message, options: rec.options, limitMs: rec.timeout }, (answer) => this.uiRespond(rec.id, answer));
             }
             return;
         }
@@ -559,6 +574,8 @@ class RpcTarget extends Target {
                     r.toolErrors++;
                 break;
             case "agent_settled":
+                // 轮次结束（含被停止）：回收卡片并按取消回复（Pi 对已结束的请求忽略回复），避免误报"超时已自动允许"。
+                dropUiPrompts(this, { cancelled: true });
                 if (r) {
                     r.settle();
                     this.noteSettled(r);
@@ -594,6 +611,28 @@ class RpcTarget extends Target {
                 reject(e);
             }
         });
+    }
+    failStart(why) {
+        log(`rpc[${this.key}] 启动失败：${why}`);
+        for (const [id, p] of this.pendingCmds) {
+            clearTimeout(p.timer);
+            const e = new Error(why);
+            e.outcome = "rejected";
+            p.reject(e);
+            this.pendingCmds.delete(id);
+        }
+        try {
+            this.proc?.kill("SIGTERM");
+        }
+        catch { }
+    }
+    uiRespond(id, answer) {
+        try {
+            this.proc?.stdin?.write(JSON.stringify({ type: "extension_ui_response", id, ...answer }) + "\n");
+        }
+        catch (e) {
+            log(`rpc[${this.key}] ui 回复写入失败：${e?.message || e}`);
+        }
     }
     async deliver(text) {
         const { run } = this.runForTurn();
@@ -753,6 +792,7 @@ class TuiTarget extends Target {
                 this.run.error = "TUI 会话已关闭";
             this.run.settle();
         }
+        dropUiPrompts(this);
         targets.delete(this.key);
     }
 }
@@ -1014,8 +1054,10 @@ function cardBlock(card, lead = "", fallback = "") {
 const cardPicks = new Map();
 function registerPick(info) {
     if (cardPicks.size > 600) {
+        // 淘汰最旧的一批；仍在等待回答的弹窗卡片保留。
         for (const k of [...cardPicks.keys()].slice(0, 300))
-            cardPicks.delete(k);
+            if (!(cardPicks.get(k)?.act === "ui" && uiPending.has(cardPicks.get(k).reqId)))
+                cardPicks.delete(k);
     }
     const key = `pb_${crypto.randomUUID()}`;
     cardPicks.set(key, { ...info, at: Date.now() });
@@ -1169,7 +1211,7 @@ function contextPctLabel(t, stats) {
 function fmtDone(t, run, stats) {
     const foot = doneFoot(t, run, stats);
     const body = (run.lastText || "（无文本输出）").trim();
-    const extra = run.blocks.length ? run.blocks.join("\n") : "";
+    const extra = "";
     const state = run.stopped ? "⚠️ 已中断" : "🏁 任务完成";
     const head = `${state} · ${t.label()}`;
     const full = plainText({ head, body, foot, extra });
@@ -1428,8 +1470,14 @@ async function resolveNumber(n) {
     log(`spawn history target ${path.basename(t.sessionFile)}`);
     const rt = new RpcTarget({ cwd: t.cwd, name: t.name, sessionFile: t.sessionFile });
     targets.set(rt.key, rt);
-    await rt.start({ sessionFile: t.sessionFile });
-    await rt.refreshMeta();
+    try {
+        await rt.start({ sessionFile: t.sessionFile });
+        await rt.refreshMeta();
+    }
+    catch (e) {
+        rt.close();
+        return { failed: plainText({ head: "⚠️ 打开历史会话失败", body: clip(t.name || t.hint || "会话", 40), foot: `原因：${String(e?.message || e).slice(0, 100)}` }) };
+    }
     const i = numMap.findIndex((x) => x.key === t.key);
     if (i >= 0)
         numMap[i] = rt;
@@ -1587,6 +1635,122 @@ async function handleModelPick(pick) {
     const { all: models = [] } = await t.listModels().catch(() => ({}));
     const m = models.find((x) => x.provider === pick.provider && x.id === pick.modelId) || { provider: pick.provider, id: pick.modelId };
     return applyModel(t, m);
+}
+// ---- 扩展弹窗转手机 ----
+const UI_KINDS = new Set(["confirm", "select", "input", "editor"]);
+const uiPending = new Map();
+const durLabel = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.max(1, Math.round(ms / 1000))} 秒`);
+// 弹窗内容放进代码块：避免 `$...$` 被企微渲染成公式、Markdown 符号被解释。
+function uiFence(text) {
+    const body = truncateUtf8(stripCtrlKeepNl(String(text || "")).trim(), UI_TEXT_MAX_BYTES).replace(/`{3,}/g, "ʼʼʼ");
+    return body ? "```\n" + body + "\n```" : "";
+}
+const uiAfterLabel = (kind) => (kind === "confirm" ? (UI_POLICY === "ask-then-allow" ? "自动允许" : "自动拒绝") : "自动取消");
+function uiTimeoutAnswer(kind) {
+    return kind === "confirm" ? { confirmed: UI_POLICY === "ask-then-allow" } : { cancelled: true };
+}
+/**
+ * 登记一个待回答的扩展弹窗；reply(answer) 把 {confirmed}|{value}|{cancelled} 交回 Pi。
+ * 由 daemon 统一计时：到点 confirm 按 remoteConfirm 处理，其余取消，任务不会卡住。
+ */
+function openUiPrompt(t, req, reply) {
+    const kind = String(req.kind);
+    const reqId = String(req.reqId || "");
+    if (!reqId || uiPending.has(reqId))
+        return;
+    const title = stripCtrl(String(req.title || "")).trim() || "扩展请求";
+    const detail = uiFence([String(req.title || ""), String(req.message || "")].filter((x) => x.trim()).join("\n\n"));
+    const who = t.label();
+    log(`ui ${kind} target=${t.key} ${JSON.stringify(clip(title, 60))}`);
+    if (kind === "editor" || (kind === "input" && t.kind !== "tui")) {
+        // 企微卡片不能输入文字、后台会话也无人在电脑前：直接取消，任务继续。
+        reply({ cancelled: true });
+        sendText(plainText({ head: `⚠️ 扩展请求输入 · ${who}`, body: detail, foot: "手机上无法填写，已取消 · 需要时请到电脑上操作" }));
+        return;
+    }
+    if (kind === "confirm" && UI_POLICY === "allow") {
+        reply({ confirmed: true });
+        sendText(plainText({ head: `✅ 已自动允许 · ${who}`, body: detail, foot: "remoteConfirm 为 allow，不再询问" }));
+        return;
+    }
+    const e = { reqId, t, kind, title, reply, done: false };
+    // 扩展自带更短的超时：Pi 到点按扩展默认值处理，我们只回收卡片。
+    const own = req.limitMs > 0 && req.limitMs < UI_TIMEOUT_MS;
+    const wait = own ? req.limitMs : UI_TIMEOUT_MS;
+    const after = own ? "按扩展默认处理" : uiAfterLabel(kind);
+    e.timer = setTimeout(() => {
+        if (own) {
+            if (closeUiPrompt(e))
+                sendText(plainText({ head: `⏱️ 请求已超时 · ${who}`, body: uiFence(title), foot: "已按扩展默认值处理，任务继续运行" }));
+            return;
+        }
+        const answer = uiTimeoutAnswer(kind);
+        if (settleUiPrompt(e, answer))
+            sendText(plainText({ head: `⏱️ 超时未处理，已${uiAfterLabel(kind)} · ${who}`, body: uiFence(title), foot: "任务继续运行，完成后推送" }));
+    }, wait);
+    e.timer.unref?.();
+    uiPending.set(reqId, e);
+    const limit = durLabel(wait);
+    if (kind === "input") {
+        // 终端会话：电脑前仍可填写；手机只提醒，到点取消。
+        sendText(plainText({ head: `✏️ 电脑端等待输入 · ${who}`, body: detail, foot: `手机上无法填写 · ${limit}内未在电脑上处理将${after}` }));
+        return;
+    }
+    let options;
+    if (kind === "confirm") {
+        options = [["允许", { confirmed: true }], ["拒绝", { confirmed: false }]];
+    }
+    else {
+        const list = (Array.isArray(req.options) ? req.options : []).filter((x) => typeof x === "string");
+        options = [...list.slice(0, VOTE_OPT_MAX - 1).map((v) => [v, { value: v }]), ["取消", { cancelled: true }]];
+        if (list.length > VOTE_OPT_MAX - 1)
+            e.more = list.length - (VOTE_OPT_MAX - 1);
+    }
+    const more = e.more ? ` · 另有 ${e.more} 项请到电脑选择` : "";
+    sendText(plainText({ head: `🔐 ${kind === "confirm" ? "需要确认" : "需要选择"} · ${who}`, body: detail, foot: `在下方卡片选择${more} · ${limit}内未选将${after}` }));
+    const card = {
+        card_type: "vote_interaction",
+        title: clip(`🔐 ${title}`, 26),
+        desc: clip(`${limit}内未选将${after}`, 30),
+        options: options.map(([text, answer]) => ({ id: registerPick({ act: "ui", reqId, answer, label: text }), text: clip(text, 60) })),
+        mode: 0,
+        submit_text: kind === "confirm" ? "确认" : "选择",
+        task_id: taskId("ui"),
+    };
+    void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: clip(title, 80), foot: `请到电脑上处理 · ${limit}内未选将${after}` })));
+}
+function closeUiPrompt(e) {
+    if (e.done)
+        return false;
+    e.done = true;
+    clearTimeout(e.timer);
+    uiPending.delete(e.reqId);
+    return true;
+}
+function settleUiPrompt(e, answer) {
+    if (!closeUiPrompt(e))
+        return false;
+    try {
+        e.reply(answer);
+    }
+    catch (err) {
+        log(`ui reply 失败：${err?.message || err}`);
+    }
+    return true;
+}
+function dropUiPrompts(t, answer = null) {
+    for (const e of [...uiPending.values()])
+        if (e.t === t)
+            answer ? settleUiPrompt(e, answer) : closeUiPrompt(e);
+}
+function handleUiPick(pick) {
+    const e = uiPending.get(pick.reqId);
+    if (!e)
+        return "这个请求已经处理过（已超时、已在电脑上回答或会话已结束）。";
+    settleUiPrompt(e, pick.answer);
+    log(`ui answered by phone target=${e.t.key} ${JSON.stringify(pick.label)}`);
+    const refused = pick.answer.confirmed === false || pick.answer.cancelled;
+    return plainText({ head: `${refused ? "🚫" : "✅"} 已${pick.answer.value !== undefined ? "选择" : pick.label} · ${e.t.label()}`, body: uiFence(pick.answer.value !== undefined ? `${e.title}\n→ ${pick.label}` : e.title), foot: "任务继续运行，完成后推送" });
 }
 const NO_BIND = () => plainText({ head: "⚠️ 未选会话", body: "还没有选定要操作的会话。", foot: "发送 `活跃会话` 选择，或 `创建会话` 新建" });
 async function statusCard() {
@@ -1756,6 +1920,8 @@ async function applyPick(pick, rows) {
     const t = await resolveNumber(rows.indexOf(row) + 1);
     if (!t)
         return fail();
+    if (t.failed)
+        return t.failed;
     bindCurrent(t);
     return buildSelectedCard(t);
 }
@@ -1811,6 +1977,11 @@ function buildCreatedCard(t, note = "") {
 }
 async function handleCardCallback({ taskId, optionId }) {
     const pick = cardPicks.get(optionId);
+    if (pick?.act === "ui" && pick.taskId === taskId) {
+        if (consumeTask(taskId))
+            return "这张卡片已经提交过。";
+        return handleUiPick(pick);
+    }
     if (!pick || pick.taskId !== taskId || Date.now() - pick.at > CARD_TTL_MS) {
         return pick?.act === "model" ? "这张模型卡片已失效，请发送 `切换模型` 重新选择。" : "这张会话卡片已失效，请发送 `活跃会话` 或 `历史会话` 重新选择。";
     }
@@ -1869,6 +2040,8 @@ async function handleCommand(text, media = [], ack = { media: false }) {
     if (/^\d+$/.test(cmd)) {
         const n = parseInt(cmd, 10);
         const t = await resolveNumber(n);
+        if (t?.failed)
+            return t.failed;
         if (!t) {
             return plainText({
                 head: "⚠️ 找不到会话",
@@ -2162,6 +2335,36 @@ async function handleHttp(req, res) {
                 t.contextWindow = o.contextWindow;
         }
         w.resolve({ ok: !!o.ok, error: o.error ? String(o.error).slice(0, 120) : "" });
+        return json(res, 200, { ok: true });
+    }
+    // 终端会话：扩展在手机发起的轮次里弹窗，终端照常显示，同时转到手机；先回答的一方生效。
+    if (p === "/ui-request" && req.method === "POST") {
+        let o = {};
+        try {
+            o = JSON.parse(await readBody(req));
+        }
+        catch { }
+        const t = targets.get(o.key);
+        if (!t || t.kind !== "tui" || !t.alive)
+            return json(res, 410, { error: "unknown target" });
+        if (!UI_KINDS.has(o.kind) || typeof o.reqId !== "string" || !o.reqId || o.reqId.length > 80)
+            return json(res, 400, { error: "bad ui request" });
+        t.lastActivity = Date.now();
+        openUiPrompt(t, o, (answer) => {
+            t.inbox.push({ type: "ui_answer", reqId: o.reqId, ...answer });
+            t.waiter?.();
+        });
+        return json(res, 200, { ok: true });
+    }
+    if (p === "/ui-done" && req.method === "POST") {
+        let o = {};
+        try {
+            o = JSON.parse(await readBody(req));
+        }
+        catch { }
+        const e = uiPending.get(o.reqId);
+        if (e && e.t.key === o.key && closeUiPrompt(e))
+            log(`ui answered on computer target=${e.t.key}`);
         return json(res, 200, { ok: true });
     }
     if (p === "/deliver-failed" && req.method === "POST") {

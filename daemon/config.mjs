@@ -17,6 +17,8 @@ export const DEFAULTS = {
   nameWaitMs: 3000, inboxDir: path.join(RUN_DIR, 'inbox'),
   agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'),
   tabTitleEnabled: true,
+  // 手机发起的任务里，扩展弹窗转到企微卡片。confirm 超时策略：ask-then-allow（默认）| ask | allow。
+  remoteConfirm: 'ask-then-allow', remoteConfirmTimeoutMs: 180000,
 };
 export function loadConfig() {
   let user = {};
@@ -30,6 +32,9 @@ export function loadConfig() {
   if (process.env.PI_REMOTE_PORT) cfg.localPort = Number(process.env.PI_REMOTE_PORT);
   if (!Number.isInteger(cfg.localPort) || cfg.localPort < 1024 || cfg.localPort > 65535) throw new Error('localPort 无效');
   if (!cfg.dirAliases || typeof cfg.dirAliases !== 'object' || Object.values(cfg.dirAliases).some(v => typeof v !== 'string')) throw new Error('dirAliases 无效');
+  if (!['ask-then-allow', 'ask', 'allow'].includes(cfg.remoteConfirm)) throw new Error('remoteConfirm 只能是 ask-then-allow、ask 或 allow');
+  // 上限 1 天：超过 2^31-1 的 setTimeout 会立即触发，等于直接放行。
+  if (!Number.isFinite(cfg.remoteConfirmTimeoutMs) || cfg.remoteConfirmTimeoutMs < 1000 || cfg.remoteConfirmTimeoutMs > 86400000) throw new Error('remoteConfirmTimeoutMs 需在 1000–86400000 毫秒之间');
   return cfg;
 }
 const validField = v => typeof v === 'string' && v.trim() && !/[\r\n\0]/.test(v);

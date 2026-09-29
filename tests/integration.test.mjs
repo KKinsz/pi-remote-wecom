@@ -47,18 +47,33 @@ import readline from 'node:readline';
 import crypto from 'node:crypto';
 const sid=crypto.randomUUID();
 const emit=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+// Real Pi blocks on session_start dialogs before reading stdin.
+const startupUi=process.cwd().endsWith('startup-ui');
+if(startupUi) emit({type:'extension_ui_request',id:'boot',method:'confirm',title:'启动授权'});
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const c=JSON.parse(line);
  let model=globalThis.model||{provider:'syn',id:'synthetic-model'};
  const models=[{provider:'syn',id:'synthetic-model'},{provider:'syn',id:'synthetic-fast',name:'Synthetic Fast'},{provider:'other',id:'hidden-model'}];
  if(c.type==='set_model') globalThis.model=model=models.find(m=>m.provider===c.provider&&m.id===c.modelId);
  const data=c.type==='get_state'?{sessionId:sid,sessionFile:'',model}:c.type==='get_available_models'?{models}:c.type==='set_model'?model:{};
+ if(startupUi) return;
+ if(c.type==='extension_ui_response'){const p=globalThis.waits?.[c.id]; if(p){delete globalThis.waits[c.id]; p(c);} return;}
  emit({type:'response',id:c.id,command:c.type,success:true,data});
+ if(c.type==='prompt'&&c.message.startsWith('确认后结束')){
+  emit({type:'extension_ui_request',id:'ui-end',method:'confirm',title:'结束前确认'});
+  setTimeout(()=>{emit({type:'message_end',message:{role:'assistant',stopReason:'aborted',content:[]}});emit({type:'agent_settled'});},100);
+  return;
+ }
+ if(c.type==='prompt'&&c.message.startsWith('需要确认')){
+  const id='ui-'+crypto.randomUUID(); (globalThis.waits||={})[id]=r=>{emit({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'确认结果：'+c.message+'='+JSON.stringify(r.confirmed)}]}});emit({type:'agent_settled'});};
+  emit({type:'extension_ui_request',id,method:'confirm',title:'Allow computer use?',message:'控制 $HOME/bin:$PATH'});
+  return;
+ }
  if(c.type==='prompt') setTimeout(()=>{emit({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'后台结果：'+c.message}]}});emit({type:'agent_settled'});},150);
 });
 `,{mode:0o700});
   fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({botId:'test-bot',secret:'test-secret',ownerUserId:'owner',localPort:port,
-    piBin:fakePi,wsUrl:`ws://127.0.0.1:${server.address().port}`,agentDir,terminal:'none',inboxDir:path.join(dir,'inbox')}));
+    piBin:fakePi,remoteConfirmTimeoutMs:5000,wsUrl:`ws://127.0.0.1:${server.address().port}`,agentDir,terminal:'none',inboxDir:path.join(dir,'inbox')}));
   fs.writeFileSync(path.join(dir,'.token'),'local-token');
   fs.writeFileSync(path.join(agentDir,'settings.json'),JSON.stringify({enabledModels:['syn/*']}));
   const child = spawn(process.execPath,['daemon/daemon.mjs'], {cwd:process.cwd(),env:{...process.env,PI_REMOTE_HOME:dir},stdio:['ignore','pipe','pipe']});
@@ -202,7 +217,50 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const ask2=await until(async()=>{const r=await api(`/poll?key=${a.key}`); return r.messages?.find(m=>m.type==='set_model');});
   await api('/model-ack',{key:a.key,reqId:ask2.reqId,ok:false,error:'未配置认证'});
   assert.match((await failing).reply,/切换模型失败[\s\S]*未配置认证/);
-  const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,4); // 2 + 2 alias sessions
+  // Extension dialogs are forwarded to the phone: background confirm answered by card, then timeout auto-allows.
+  const pickUi=(card,label)=>socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:card.task_id,selected_items:{selected_item:[{question_key:card.task_id,option_ids:{option_id:[card.checkbox.option_list.find(o=>o.text===label).id]}}]}}}}}));
+  const uiCards=()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('Allow computer use')).map(x=>x.template_card);
+  await api('/command',{text:'创建后台会话 proj 需要确认甲'});
+  const uiCard=await until(()=>uiCards()[0]);
+  assert.deepEqual(uiCard.checkbox.option_list.map(o=>o.text),['允许','拒绝']);
+  assert.match(uiCard.main_title.desc,/未选将自动允许/);
+  assert.ok(sent.some(x=>x.markdown?.content.includes('```\nAllow computer use?\n\n控制 $HOME/bin:$PATH\n```'))); // fenced: no math rendering
+  pickUi(uiCard,'拒绝');
+  await until(()=>sent.some(x=>x.markdown?.content.includes('确认结果：需要确认甲=false')));
+  assert.ok(sent.some(x=>x.markdown?.content.includes('已拒绝')));
+  // A run that ends while its dialog is pending retires the card: no later "timed out, auto-allowed".
+  await api('/command',{text:'创建后台会话 proj 确认后结束'});
+  const endCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('结束前确认')).at(-1)?.template_card);
+  await until(()=>sent.some(x=>/已中断 · .*确认后结束/.test(x.markdown?.content||'')));
+  pickUi(endCard,'允许'); await until(()=>sent.filter(x=>x.markdown?.content.includes('这个请求已经处理过')).length===1);
+
+  pickUi(uiCard,'允许'); await until(()=>sent.some(x=>x.markdown?.content.includes('已经提交过')));
+  await api('/command',{text:'创建后台会话 proj 需要确认乙'});
+  await until(()=>uiCards().length===2);
+  await until(()=>sent.some(x=>x.markdown?.content.includes('确认结果：需要确认乙=true')),10000);
+  assert.ok(sent.some(x=>x.markdown?.content.includes('超时未处理，已自动允许')));
+  // A dialog during startup cannot be answered over RPC: fail fast with a clear reason instead of a 30s timeout.
+  fs.mkdirSync(path.join(dir,'startup-ui'));
+  fs.writeFileSync(path.join(dir,'aliases.json'),JSON.stringify({proj:aliasDir,sui:path.join(dir,'startup-ui')}));
+  const started=Date.now(); const boot=await api('/command',{text:'创建后台会话 sui 启动任务'});
+  assert.match(boot.reply,/新建失败[\s\S]*启动时请求确认[\s\S]*启动授权/); assert.ok(Date.now()-started<3000);
+  // Terminal session: the extension forwards its dialog; phone answer is delivered through poll.
+  await api('/command',{text:'ls'});
+  const tuiUi=await api('/ui-request',{key:a.key,reqId:'tui-ui-1',kind:'select',title:'选择环境',options:['dev','prod']});
+  assert.equal(tuiUi.ok,true);
+  const selCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('选择环境')).at(-1)?.template_card);
+  assert.deepEqual(selCard.checkbox.option_list.map(o=>o.text),['dev','prod','取消']);
+  pickUi(selCard,'prod');
+  await until(()=>sent.some(x=>x.markdown?.content.includes('已选择 · 会话A')&&x.markdown.content.includes('→ prod')));
+  const ans=(await api(`/poll?key=${a.key}`)).messages.find(m=>m.type==='ui_answer');
+  assert.deepEqual(ans,{type:'ui_answer',reqId:'tui-ui-1',value:'prod'});
+  // Answered on the computer first: the phone card becomes stale.
+  await api('/ui-request',{key:a.key,reqId:'tui-ui-2',kind:'confirm',title:'电脑先答'});
+  const localCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('电脑先答')).at(-1)?.template_card);
+  await api('/ui-done',{key:a.key,reqId:'tui-ui-2'});
+  pickUi(localCard,'允许'); await until(()=>sent.filter(x=>x.markdown?.content.includes('这个请求已经处理过')).length===2);
+  assert.equal((await api('/ui-request',{key:a.key,reqId:'x',kind:'custom'})).error,'bad ui request');
+  const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,7); // 2 + 2 alias + 3 confirm sessions
   assert.equal(all.targets.filter(x=>x.kind==='tui').length,2);
   assert.equal(errors,'');
 });

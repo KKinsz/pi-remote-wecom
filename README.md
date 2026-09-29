@@ -104,7 +104,11 @@ Before removing the package, run `node bin/remote.mjs uninstall` from its instal
 
 The maintainer has confirmed real-device testing of the main workflow and major commands. Automated checks also cover offline Pi loading, session routing, binding, deduplication, attachments, and card callbacks. This does not claim exhaustive validation of every terminal, external enterprise account, or sleep/network failure scenario.
 
-Only the bound user's direct messages are accepted. The computer must remain awake and online. Background sessions have a read-only guard, which is not an OS sandbox; terminal sessions retain their existing permissions. Credentials stay on the local machine, but setup does not mask the Secret input. See [security and data handling](SECURITY.md).
+Only the bound user's direct messages are accepted. The computer must remain awake and online. Background sessions have the same capabilities as terminal sessions: they load your installed extensions and can read, write, and run commands.
+
+**Extension prompts on the phone**: during a phone-initiated task, extension confirmations and selections (for example computer-use authorization) are sent to WeCom as cards; in terminal sessions whichever side answers first wins. Unanswered prompts follow `remoteConfirm`: `ask-then-allow` (default; allow after `remoteConfirmTimeoutMs`, 3 minutes), `ask` (deny on timeout), or `allow` (allow without asking). Text-input prompts cannot be filled on the phone: background sessions cancel them, terminal sessions keep them open on the computer until the timeout. If an extension asks for confirmation while a background session is starting, creation fails with a hint to use a terminal session.
+
+ Credentials stay on the local machine, but setup does not mask the Secret input. See [security and data handling](SECURITY.md).
 
 ## Development
 

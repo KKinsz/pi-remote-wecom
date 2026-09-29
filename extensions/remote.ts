@@ -9,7 +9,10 @@ type Runtime = {
   key: string | null; token: string; port: number; statusKey: string;
   runId: string | null; text: string; toolCalls: number; queued: number;
   stopped: boolean; error: string; lastBeat: number;
+  phone: boolean; uiWaits: Map<string, (answer: Json) => void>; uiReqs: Map<string, Json>;
 };
+type DialogKind = 'confirm' | 'select' | 'input' | 'editor';
+const UI_PATCHED = Symbol.for('pi-remote-wecom.ui');
 function meta(ctx: ExtensionContext) {
   const usage = ctx.getContextUsage();
   return {model: ctx.model?.id || '', modelProvider: ctx.model?.provider || '', ctxPercent: usage?.percent ?? null, contextWindow: usage?.contextWindow ?? ctx.model?.contextWindow ?? null};
@@ -44,6 +47,64 @@ function renderStatus(label: string, tone: Tone) {
 }
 export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean} = {}) {
   let active: Runtime | undefined;
+  /**
+   * 手机发起的轮次里，扩展弹窗同时转到手机：终端照常显示，谁先回答用谁的，另一边关闭。
+   * Pi 没有官方的"外部回答弹窗"接口，这里替换共享的 ctx.ui 方法；替换失败或不在手机轮次时原样透传。
+   */
+  async function remoteDialog(kind: DialogKind, req: Json, opts: any, local: (opts: any) => Promise<any>, map: (answer: Json) => any) {
+    const r = active;
+    if (!r || r.cancelled || !r.key || !r.runId || !r.phone) return local(opts);
+    const reqId = randomUUID();
+    // lost：daemon 失联/重启导致手机侧答案不会再来，退回只等电脑。
+    const answer = new Promise<Json>(resolve => r.uiWaits.set(reqId, resolve));
+    const body = {reqId, kind, ...req, limitMs: opts?.timeout};
+    const sent = await call(r, '/ui-request', {key: r.key, ...body});
+    if (!sent?.ok) {r.uiWaits.delete(reqId); return local(opts);}
+    r.uiReqs.set(reqId, body); // 重新注册后重发：daemon 重启时手机上重新出卡片
+    // editor 不支持中途关闭：手机轮次里交给 daemon（立即取消并提示）；手机侧失联才打开终端编辑器。
+    if (kind === 'editor') {
+      const a = await answer;
+      return a.lost ? local(opts) : map(a);
+    }
+    const closeLocal = new AbortController();
+    const signal = opts?.signal ? AbortSignal.any([opts.signal, closeLocal.signal]) : closeLocal.signal;
+    const localAnswer = local({...opts, signal}).then(value => ({local: true, value}));
+    // 兜底：daemon 重启会丢掉手机侧计时，本地按同一策略到点处理（略晚于 daemon，正常情况下不会触发）。
+    let fallback: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<{local: false; value: Json}>(resolve => {
+      let remoteConfirm = 'ask-then-allow', remoteConfirmTimeoutMs = 180000;
+      try {({remoteConfirm, remoteConfirmTimeoutMs} = loadConfig());} catch {}
+      if (opts?.timeout > 0 && opts.timeout < remoteConfirmTimeoutMs) return; // 扩展自带更短超时，交给 Pi
+      fallback = setTimeout(() => resolve({local: false, value: kind === 'confirm' ? {confirmed: remoteConfirm !== 'ask'} : {cancelled: true}}), remoteConfirmTimeoutMs + 5000);
+    });
+    const phone = answer.then(value => ({local: false as const, value}));
+    let winner = await Promise.race([localAnswer, phone, late]);
+    if (!winner.local && (winner.value as Json).lost) winner = await Promise.race([localAnswer, late]);
+    clearTimeout(fallback);
+    r.uiWaits.delete(reqId); r.uiReqs.delete(reqId);
+    if (winner.local) {void call(r, '/ui-done', {key: r.key, reqId}); return winner.value;}
+    closeLocal.abort();
+    return map(winner.value);
+  }
+  function loseUi(r: Runtime) {
+    for (const resolve of r.uiWaits.values()) resolve({lost: true});
+    r.uiWaits.clear(); r.uiReqs.clear();
+  }
+  function patchUi(ui: any) {
+    if (!ui || ui[UI_PATCHED] || typeof ui.confirm !== 'function' || typeof ui.select !== 'function') return;
+    try {
+      const orig = {confirm: ui.confirm, select: ui.select, input: ui.input, editor: ui.editor};
+      ui.confirm = (title: string, message: string, opts?: any) => remoteDialog('confirm', {title, message}, opts,
+        o => orig.confirm.call(ui, title, message, o), a => !a.cancelled && a.confirmed === true);
+      ui.select = (title: string, options: string[], opts?: any) => remoteDialog('select', {title, options}, opts,
+        o => orig.select.call(ui, title, options, o), a => a.cancelled ? undefined : options.includes(a.value) ? a.value : undefined);
+      if (typeof orig.input === 'function') ui.input = (title: string, placeholder?: string, opts?: any) => remoteDialog('input', {title, message: placeholder || ''}, opts,
+        o => orig.input.call(ui, title, placeholder, o), a => a.cancelled ? undefined : a.value);
+      if (typeof orig.editor === 'function') ui.editor = (title: string, prefill?: string) => remoteDialog('editor', {title}, undefined,
+        () => orig.editor.call(ui, title, prefill), a => a.cancelled ? undefined : a.value);
+      Object.defineProperty(ui, UI_PATCHED, {value: true});
+    } catch {/* 只读或结构变化：保持原样，终端弹窗照常可用 */}
+  }
   async function call(r: Runtime, endpoint: string, body?: Json, timeout = 3000): Promise<Json | null> {
     try {
       const response = await fetch(`http://127.0.0.1:${r.port}${endpoint}`, {
@@ -77,6 +138,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const r = active; active = undefined;
     if (!r) return;
     r.cancelled = true;
+    loseUi(r);
     // Cancel the long poll immediately. Use a separate finite request for unregister.
     r.cancel.abort(); r.ctx.ui.setStatus(r.statusKey, undefined); painted = null;
     if (r.key) {
@@ -88,12 +150,14 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   }
   pi.on('session_start', async (_event, ctx) => {
     await stop();
-    if (ctx.mode !== 'tui' || process.env.PI_REMOTE_READONLY === '1') return;
+    // 后台会话（daemon 启动的 RPC 子进程）也会加载本包：只在终端会话里连接。
+    if (ctx.mode !== 'tui') return;
     const cfg = loadConfig();
     const r: Runtime = {ctx, cancelled: false, cancel: new AbortController(), key: null,
       token: '', port: cfg.localPort, statusKey: cfg.statusKey, runId: null, text: '',
-      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0};
+      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map()};
     active = r;
+    patchUi(ctx.ui);
     configureStatus(cfg);
     // Placeholder after the session_start chain so the entry sorts last in the footer.
     setTimeout(() => {if (active === r && painted === null) status(r, '连接中', 'gray');}, 0);
@@ -116,9 +180,13 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
           paintLink(r, registered.tunnel);
           // If daemon restarted during a run, restore the exact run identity, not a guessed new turn.
           if (r.runId) await call(r, '/turn', {key: r.key, runId: r.runId, local: r.queued === 0});
+          // daemon 对已登记的 reqId 忽略重发；重启后的新 daemon 则重新出卡片并重新计时。
+          for (const body of r.uiReqs.values()) await call(r, '/ui-request', {key: r.key, ...body});
         }
         const response = await call(r, `/poll?key=${encodeURIComponent(r.key!)}`, undefined, 40000);
         if (r.cancelled) break;
+        // 轮询失败只重新注册：daemon 若仍在，uiPending 与 target 都会保留，手机晚到的答案照样生效；
+        // daemon 重启则由本地兜底计时处理。
         if (!response) {r.key = null; continue;}
         paintLink(r, response.tunnel);
         for (const msg of response.messages || []) {
@@ -127,6 +195,11 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
             const accepted = !!r.runId && msg.runId === r.runId && !ctx.isIdle();
             if (accepted) {r.stopped = true; ctx.abort();}
             await call(r, '/abort-ack', {key: r.key, runId: msg.runId, accepted});
+            continue;
+          }
+          if (msg.type === 'ui_answer') {
+            const resolve = r.uiWaits.get(String(msg.reqId));
+            if (resolve) {r.uiWaits.delete(String(msg.reqId)); resolve(msg);}
             continue;
           }
           if (msg.type === 'set_model') {
@@ -143,6 +216,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
           }
           if (typeof msg.text !== 'string' || !msg.text) continue;
           r.queued++;
+          if (r.runId) r.phone = true; // 本地轮次中途插入手机消息：与 daemon 一样视为手机轮次
           try {pi.sendUserMessage(msg.text, {deliverAs: 'followUp'});}
           catch {r.queued--; await call(r, '/deliver-failed', {key: r.key, error: 'Pi 拒绝投递'}); continue;}
           ctx.ui.notify('收到手机消息', 'info');
@@ -161,7 +235,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   pi.on('before_agent_start', async (event) => {
     const r = active; if (!r) return;
     r.runId = randomUUID(); r.text = ''; r.toolCalls = 0; r.stopped = false; r.error = ''; r.lastBeat = 0;
-    const local = r.queued === 0; r.queued = 0;
+    const local = r.queued === 0; r.queued = 0; r.phone = !local;
     if (r.key) await call(r, '/turn', {key: r.key, runId: r.runId, prompt: event.prompt.slice(0, 200), local});
   });
   const beat = () => {
@@ -185,7 +259,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const body = {key: r.key, runId: id, text: r.text, toolCalls: r.toolCalls,
       stopped: r.stopped, error: r.error, sessionName: pi.getSessionName() || '', ...meta(ctx)};
     // Snapshot before I/O: a new turn must not be wiped by a late result acknowledgement.
-    r.runId = null;
+    r.runId = null; r.phone = false;
     for (let i = 0; i < 3 && !r.cancelled; i++) {
       if (await call(r, '/result', body)) break;
       await delay(r, 500 * (i + 1));
@@ -193,7 +267,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   });
   const refreshRegistration = async (_event: unknown, ctx: ExtensionContext) => {
     const r = active; if (!r) return;
-    r.ctx = ctx;
+    r.ctx = ctx; patchUi(ctx.ui);
     if (r.key) await call(r, '/register', registration(r));
   };
   pi.on('session_info_changed', refreshRegistration);
