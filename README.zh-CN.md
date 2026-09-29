@@ -11,8 +11,6 @@
 
 ## 功能预览
 
-真机截图，个人信息与内部信息已遮挡；点击图片可查看大图。
-
 | 命令帮助 | 会话管理 | 创建会话 | 切换模型 | 任务回传 |
 | --- | --- | --- | --- | --- |
 | <a href="docs/images/commands.png"><img src="docs/images/commands.png" width="180" alt="命令帮助"></a> | <a href="docs/images/sessions.png"><img src="docs/images/sessions.png" width="180" alt="会话管理"></a> | <a href="docs/images/create-session.png"><img src="docs/images/create-session.png" width="180" alt="创建会话"></a> | <a href="docs/images/switch-model.png"><img src="docs/images/switch-model.png" width="180" alt="切换模型"></a> | <a href="docs/images/task-result.png"><img src="docs/images/task-result.png" width="180" alt="任务回传"></a> |
