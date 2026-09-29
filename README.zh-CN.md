@@ -9,6 +9,15 @@
 - **会话自动命名**：根据首条输入生成名称，也可手动修改；终端标签与手机会话名同步。
 - **本机直连**：通过企微智能机器人长连接工作，无需额外服务器。
 
+## 功能预览
+
+真机截图，个人信息与内部信息已遮挡；点击图片可查看大图。
+
+| 命令帮助 | 会话管理 | 创建会话 | 切换模型 | 任务回传 |
+| --- | --- | --- | --- | --- |
+| <a href="docs/images/commands.png"><img src="docs/images/commands.png" width="180" alt="命令帮助"></a> | <a href="docs/images/sessions.png"><img src="docs/images/sessions.png" width="180" alt="会话管理"></a> | <a href="docs/images/create-session.png"><img src="docs/images/create-session.png" width="180" alt="创建会话"></a> | <a href="docs/images/switch-model.png"><img src="docs/images/switch-model.png" width="180" alt="切换模型"></a> | <a href="docs/images/task-result.png"><img src="docs/images/task-result.png" width="180" alt="任务回传"></a> |
+| 用中文或短命令查看可用操作。 | 选择活跃会话，或查找历史会话。 | 手机发起新会话，完成后回传结果。 | 直接在卡片中切换当前会话模型。 | 远程下发任务，并接收完成回执。 |
+
 ## 安装
 
 需要 **macOS、Node.js ≥22.19、Pi Coding Agent**（已验证 0.87.1），以及一个专用的企微智能机器人。

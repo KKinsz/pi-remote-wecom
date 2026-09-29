@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import {execFileSync} from 'node:child_process';
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+const screenshotFiles = ['commands', 'sessions', 'create-session', 'switch-model', 'task-result'].map(name => `docs/images/${name}.png`);
 const problems = [];
 const publicRelease = process.argv.includes('--public');
 if (publicRelease) {
@@ -22,11 +23,11 @@ if (pkg.version !== lock.version || pkg.version !== lock.packages[''].version) p
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const [pack] = JSON.parse(execFileSync(npm, ['pack', '--dry-run', '--json', '--ignore-scripts'], {encoding:'utf8'}));
 const files = pack.files.map(f => f.path);
-for (const file of [...pkg.pi.extensions, ...Object.values(pkg.bin), 'vendor/tab-title/LICENSE', 'LICENSE', 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'NOTICE.md', 'SECURITY.md', 'CONTRIBUTING.md', 'RELEASING.md', 'config.example.json']) {
+for (const file of [...screenshotFiles, ...pkg.pi.extensions, ...Object.values(pkg.bin), 'vendor/tab-title/LICENSE', 'LICENSE', 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', 'NOTICE.md', 'SECURITY.md', 'CONTRIBUTING.md', 'RELEASING.md', 'config.example.json']) {
   if (!files.includes(file.replace(/^\.\//, ''))) problems.push(`${file}: missing from package`);
 }
 for (const file of files) {
-  if (!/^(extensions\/|daemon\/|bin\/|vendor\/|package.json$|README(?:\.zh-CN)?.md$|CONTRIBUTING.md$|RELEASING.md$|NOTICE.md$|CHANGELOG.md$|LICENSE$|SECURITY.md$|config.example.json$)/.test(file)) problems.push(`${file}: unexpected package file`);
+  if (!screenshotFiles.includes(file) && !/^(extensions\/|daemon\/|bin\/|vendor\/|package.json$|README(?:\.zh-CN)?.md$|CONTRIBUTING.md$|RELEASING.md$|NOTICE.md$|CHANGELOG.md$|LICENSE$|SECURITY.md$|config.example.json$)/.test(file)) problems.push(`${file}: unexpected package file`);
 }
 let tracked;
 try { tracked = execFileSync('git', ['ls-files', '-z'], {encoding:'utf8'}).split('\0').filter(Boolean); }

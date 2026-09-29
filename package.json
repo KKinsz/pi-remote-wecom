@@ -33,7 +33,12 @@
     "SECURITY.md",
     "NOTICE.md",
     "CONTRIBUTING.md",
-    "RELEASING.md"
+    "RELEASING.md",
+    "docs/images/commands.png",
+    "docs/images/sessions.png",
+    "docs/images/create-session.png",
+    "docs/images/switch-model.png",
+    "docs/images/task-result.png"
   ],
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7"
