@@ -1,6 +1,6 @@
 {
   "name": "pi-remote-wecom",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Control multiple local Pi sessions from WeCom, with session naming, attachments, and task results.",
   "type": "module",
   "license": "MIT",
@@ -33,12 +33,7 @@
     "SECURITY.md",
     "NOTICE.md",
     "CONTRIBUTING.md",
-    "RELEASING.md",
-    "docs/images/commands.png",
-    "docs/images/sessions.png",
-    "docs/images/create-session.png",
-    "docs/images/switch-model.png",
-    "docs/images/task-result.png"
+    "RELEASING.md"
   ],
   "dependencies": {
     "@wecom/aibot-node-sdk": "1.0.7"

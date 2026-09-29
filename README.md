@@ -13,16 +13,22 @@ Control your local [Pi coding agent](https://pi.dev) from WeCom on your phone. O
 
 | Commands | Sessions | New session | Switch models | Task results |
 | --- | --- | --- | --- | --- |
-| <a href="docs/images/commands.png"><img src="docs/images/commands.png" width="180" alt="Commands"></a> | <a href="docs/images/sessions.png"><img src="docs/images/sessions.png" width="180" alt="Sessions"></a> | <a href="docs/images/create-session.png"><img src="docs/images/create-session.png" width="180" alt="New session"></a> | <a href="docs/images/switch-model.png"><img src="docs/images/switch-model.png" width="180" alt="Switch models"></a> | <a href="docs/images/task-result.png"><img src="docs/images/task-result.png" width="180" alt="Task results"></a> |
+| <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/commands.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/commands.png" width="180" alt="Commands"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/sessions.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/sessions.png" width="180" alt="Sessions"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/create-session.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/create-session.png" width="180" alt="New session"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/switch-model.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/switch-model.png" width="180" alt="Switch models"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/task-result.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/task-result.png" width="180" alt="Task results"></a> |
 
 ## Install
 
 Requires **macOS, Node.js ≥22.19, Pi Coding Agent** (tested with 0.87.1), and a dedicated WeCom intelligent bot with **API mode → persistent connection** enabled. A regular group webhook bot is not sufficient. Feature availability depends on your enterprise; use with external enterprise accounts has not been separately verified.
 
-An npm release is not available yet. Install from this repository's Git URL (substitute the actual repository address):
+Install from npm:
 
 ```sh
-pi install git:<repository-git-url>
+pi install npm:pi-remote-wecom
+```
+
+Or from Git:
+
+```sh
+pi install git:github.com/KKinsz/pi-remote-wecom
 ```
 
 Alternatively, install from a source checkout:

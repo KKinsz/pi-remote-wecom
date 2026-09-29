@@ -13,16 +13,22 @@
 
 | 命令帮助 | 会话管理 | 创建会话 | 切换模型 | 任务回传 |
 | --- | --- | --- | --- | --- |
-| <a href="docs/images/commands.png"><img src="docs/images/commands.png" width="180" alt="命令帮助"></a> | <a href="docs/images/sessions.png"><img src="docs/images/sessions.png" width="180" alt="会话管理"></a> | <a href="docs/images/create-session.png"><img src="docs/images/create-session.png" width="180" alt="创建会话"></a> | <a href="docs/images/switch-model.png"><img src="docs/images/switch-model.png" width="180" alt="切换模型"></a> | <a href="docs/images/task-result.png"><img src="docs/images/task-result.png" width="180" alt="任务回传"></a> |
+| <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/commands.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/commands.png" width="180" alt="命令帮助"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/sessions.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/sessions.png" width="180" alt="会话管理"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/create-session.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/create-session.png" width="180" alt="创建会话"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/switch-model.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/switch-model.png" width="180" alt="切换模型"></a> | <a href="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/task-result.png"><img src="https://raw.githubusercontent.com/KKinsz/pi-remote-wecom/main/docs/images/task-result.png" width="180" alt="任务回传"></a> |
 
 ## 安装
 
 需要 **macOS、Node.js ≥22.19、Pi Coding Agent**（已验证 0.87.1），以及一个专用的企微智能机器人。
 
-暂未发布 npm，可从本仓库的 Git 地址安装（替换为实际仓库地址）：
+从 npm 安装：
 
 ```sh
-pi install git:<本仓库 Git 地址>
+pi install npm:pi-remote-wecom
+```
+
+或从 Git 安装：
+
+```sh
+pi install git:github.com/KKinsz/pi-remote-wecom
 ```
 
 也可在仓库目录中直接源码安装：
