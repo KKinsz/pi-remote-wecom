@@ -1,0 +1,24 @@
+# All checks use fake credentials and temporary agent directories; no model calls.
+'**':
+  push:
+    - docker:
+        image: node:22.19.0
+      stages:
+        - name: install
+          script: npm ci --ignore-scripts
+        - name: check
+          script: npm run check
+        - name: production-audit
+          script: npm audit --omit=dev
+        - name: package-load
+          script: npm run test:package
+  pull_request:
+    - docker:
+        image: node:22.19.0
+      stages:
+        - name: install
+          script: npm ci --ignore-scripts
+        - name: check
+          script: npm run check
+        - name: package-load
+          script: npm run test:package

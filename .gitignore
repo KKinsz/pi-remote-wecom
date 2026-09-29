@@ -1,0 +1,17 @@
+node_modules/
+*.tgz
+.DS_Store
+
+# Local credentials and runtime state (never commit these)
+.env
+.env.*
+!.env.example
+config.json
+aliases.json
+.token
+*.pem
+*.key
+*.log
+inbox/
+outbox/
+markdown/

@@ -1,0 +1,11 @@
+{
+  "botId": "",
+  "secret": "",
+  "ownerUserId": "",
+  "localPort": 18778,
+  "terminal": "auto",
+  "tabTitleEnabled": true,
+  "nameWaitMs": 3000,
+  "kittySocket": "",
+  "tmuxSession": "pi"
+}
