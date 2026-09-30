@@ -10,9 +10,27 @@ type Runtime = {
   runId: string | null; text: string; toolCalls: number; queued: number;
   stopped: boolean; error: string; lastBeat: number;
   phone: boolean; uiWaits: Map<string, (answer: Json) => void>; uiReqs: Map<string, Json>;
+  asking: Asking[];
 };
+/** 正在执行的提问工具（pi 示例 question / questionnaire 的参数形状），供 ui.custom 识别。 */
+type Asking = {toolCallId: string; kind: 'question' | 'questionnaire'; args: Json};
+type QOption = {label: string; description?: string; value?: string};
+type Question = {id: string; label: string; prompt: string; options: QOption[]; allowOther: boolean};
 type DialogKind = 'confirm' | 'select' | 'input' | 'editor';
 const UI_PATCHED = Symbol.for('pi-remote-wecom.ui');
+const isOptions = (x: unknown): x is QOption[] => Array.isArray(x) && x.every(o => o && typeof o.label === 'string');
+/** 按参数形状识别提问工具，不绑定工具名：question {question, options} / questionnaire {questions[]}。 */
+function askingKind(args: any): Asking['kind'] | null {
+  if (args && typeof args.question === 'string' && isOptions(args.options)) return 'question';
+  if (args && Array.isArray(args.questions) && args.questions.length
+    && args.questions.every((q: any) => q && typeof q.prompt === 'string' && isOptions(q.options))) return 'questionnaire';
+  return null;
+}
+/** 与示例 questionnaire 相同的默认值归一化，保证手机答案交回后 details 与终端作答一致。 */
+function normalizeQuestions(a: Asking): Question[] {
+  if (a.kind === 'question') return [{id: 'q', label: 'Q1', prompt: a.args.question, options: a.args.options, allowOther: true}];
+  return a.args.questions.map((q: any, i: number) => ({...q, label: q.label || `Q${i + 1}`, allowOther: q.allowOther !== false}));
+}
 function meta(ctx: ExtensionContext) {
   const usage = ctx.getContextUsage();
   return {model: ctx.model?.id || '', modelProvider: ctx.model?.provider || '', ctxPercent: usage?.percent ?? null, contextWindow: usage?.contextWindow ?? ctx.model?.contextWindow ?? null};
@@ -86,6 +104,60 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     closeLocal.abort();
     return map(winner.value);
   }
+  /** 发一个手机端请求；返回 null 表示没发出去（daemon 不可用），只等电脑。 */
+  async function askPhone(r: Runtime, kind: string, req: Json) {
+    const reqId = randomUUID();
+    const answer = new Promise<Json>(resolve => r.uiWaits.set(reqId, resolve));
+    const body = {reqId, kind, ...req};
+    const sent = r.key ? await call(r, '/ui-request', {key: r.key, ...body}) : null;
+    if (!sent?.ok) {r.uiWaits.delete(reqId); return null;}
+    r.uiReqs.set(reqId, body);
+    return {reqId, answer};
+  }
+  /**
+   * 提问工具（ui.custom）转手机：终端组件照常显示；包一层 factory 拿到它的 done，
+   * 手机答完后用工具自己的结果形状调用 done，工具按原逻辑生成结果。电脑先答则收回手机卡片。
+   */
+  function remoteCustom(ui: any, orig: Function, factory: Function, options: any) {
+    // 提问工具不限手机轮次：模型主动提问时人可能已离开电脑，电脑发起的轮次也推到手机。
+    const r = active; const asking = r?.asking.shift(); // 一次工具调用只接管第一个 custom
+    if (!r || !asking || r.cancelled || !r.key || !r.runId) return orig.call(ui, factory, options);
+    let done: ((v: any) => void) | undefined;
+    const wrapped = (tui: any, theme: any, kb: any, d: (v: any) => void) => {done = d; return factory(tui, theme, kb, d);};
+    let localDone = false;
+    const local: Promise<any> = Promise.resolve(orig.call(ui, wrapped, options)).finally(() => {localDone = true;});
+    const LOCAL = Symbol('local');
+    const localWin = local.then(() => LOCAL, () => LOCAL);
+    void (async () => {
+      const questions = normalizeQuestions(asking);
+      const answers: Json[] = [];
+      let cancelled = false;
+      for (let i = 0; i < questions.length && !localDone; i++) {
+        const q = questions[i];
+        const step = questions.length > 1 ? `（${i + 1}/${questions.length}）` : '';
+        const req = await askPhone(r, 'question', {title: `${step}${q.prompt}`, options: q.options.map(o => o.label),
+          descriptions: q.options.map(o => o.description || ''), allowText: q.allowOther});
+        if (!req) return;
+        const a = await Promise.race([req.answer, localWin]);
+        r.uiWaits.delete(req.reqId); r.uiReqs.delete(req.reqId);
+        if (a === LOCAL) {void call(r, '/ui-done', {key: r.key, reqId: req.reqId}); return;}
+        const v = a as Json;
+        if (v.lost) return;
+        if (v.cancelled) {cancelled = true; break;}
+        const idx = Number(v.index);
+        const opt = !v.custom && idx >= 1 ? q.options[idx - 1] : undefined;
+        if (opt) answers.push({id: q.id, value: opt.value ?? opt.label, label: opt.label, wasCustom: false, index: idx});
+        else if (q.allowOther && typeof v.value === 'string' && v.value.trim()) answers.push({id: q.id, value: v.value.trim(), label: v.value.trim(), wasCustom: true});
+        else {cancelled = true; break;}
+      }
+      if (localDone || !done) return;
+      if (asking.kind === 'question') {
+        const a = answers[0];
+        done(cancelled || !a ? null : a.wasCustom ? {answer: a.label, wasCustom: true} : {answer: a.label, wasCustom: false, index: a.index});
+      } else done({questions, answers, cancelled});
+    })().catch(() => {});
+    return local;
+  }
   function loseUi(r: Runtime) {
     for (const resolve of r.uiWaits.values()) resolve({lost: true});
     r.uiWaits.clear(); r.uiReqs.clear();
@@ -100,6 +172,10 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
         o => orig.select.call(ui, title, options, o), a => a.cancelled ? undefined : options.includes(a.value) ? a.value : undefined);
       if (typeof orig.input === 'function') ui.input = (title: string, placeholder?: string, opts?: any) => remoteDialog('input', {title, message: placeholder || ''}, opts,
         o => orig.input.call(ui, title, placeholder, o), a => a.cancelled ? undefined : a.value);
+      if (typeof ui.custom === 'function') {
+        const custom = ui.custom;
+        ui.custom = (factory: Function, options?: any) => remoteCustom(ui, custom, factory, options);
+      }
       if (typeof orig.editor === 'function') ui.editor = (title: string, prefill?: string) => remoteDialog('editor', {title}, undefined,
         () => orig.editor.call(ui, title, prefill), a => a.cancelled ? undefined : a.value);
       Object.defineProperty(ui, UI_PATCHED, {value: true});
@@ -155,7 +231,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const cfg = loadConfig();
     const r: Runtime = {ctx, cancelled: false, cancel: new AbortController(), key: null,
       token: '', port: cfg.localPort, statusKey: cfg.statusKey, runId: null, text: '',
-      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map()};
+      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: []};
     active = r;
     patchUi(ctx.ui);
     configureStatus(cfg);
@@ -243,7 +319,17 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     if (!r?.key || !r.runId || Date.now() - r.lastBeat < 15000) return;
     r.lastBeat = Date.now(); void call(r, '/activity', {key: r.key, runId: r.runId});
   };
-  pi.on('tool_execution_start', () => {if (active) active.toolCalls++; beat();});
+  pi.on('tool_execution_start', (event) => {
+    if (active) {
+      active.toolCalls++;
+      const kind = askingKind(event?.args);
+      if (kind) active.asking.push({toolCallId: event.toolCallId, kind, args: event.args});
+    }
+    beat();
+  });
+  pi.on('tool_execution_end', (event) => {
+    if (active) active.asking = active.asking.filter(a => a.toolCallId !== event?.toolCallId);
+  });
   pi.on('message_end', (event) => {
     const r = active; if (!r || event.message.role !== 'assistant') return;
     const msg = event.message;
@@ -259,7 +345,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const body = {key: r.key, runId: id, text: r.text, toolCalls: r.toolCalls,
       stopped: r.stopped, error: r.error, sessionName: pi.getSessionName() || '', ...meta(ctx)};
     // Snapshot before I/O: a new turn must not be wiped by a late result acknowledgement.
-    r.runId = null; r.phone = false;
+    r.runId = null; r.phone = false; r.asking = [];
     for (let i = 0; i < 3 && !r.cancelled; i++) {
       if (await call(r, '/result', body)) break;
       await delay(r, 500 * (i + 1));

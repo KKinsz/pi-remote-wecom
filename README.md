@@ -61,7 +61,7 @@ On your phone, select a session and send a message to continue it.
 | `stop` | Interrupt the current task |
 | `help` | Show all commands |
 
-Send an image or file, then add instructions within five minutes. Up to four attachments are accepted per batch, each at most 20 MB. Completed tasks send their results back; long results arrive as a Markdown file.
+Send an image or file, then add instructions within five minutes. Up to four attachments are accepted per batch (a project limit); each may be at most 100 MiB (104,857,600 bytes), implemented from WeCom's documented "100M" callback limit, which states no exact byte definition — inbound only. Completed tasks send their results back; long results arrive as a Markdown file, and outbound files are bounded by the SDK's chunked upload at roughly 50 MiB.
 
 In Pi:
 
@@ -107,6 +107,8 @@ The maintainer has confirmed real-device testing of the main workflow and major 
 Only the bound user's direct messages are accepted. The computer must remain awake and online. Background sessions have the same capabilities as terminal sessions: they load your installed extensions and can read, write, and run commands.
 
 **Extension prompts on the phone**: during a phone-initiated task, extension confirmations and selections (for example computer-use authorization) are sent to WeCom as cards; in terminal sessions whichever side answers first wins. Unanswered prompts follow `remoteConfirm`: `ask-then-allow` (default; allow after `remoteConfirmTimeoutMs`, 3 minutes), `ask` (deny on timeout), or `allow` (allow without asking). Text-input prompts cannot be filled on the phone: background sessions cancel them, terminal sessions keep them open on the computer until the timeout. If an extension asks for confirmation while a background session is starting, creation fails with a hint to use a terminal session.
+
+**Question tools on the phone**: compatible with Pi's example `question` / `questionnaire` tools. In terminal sessions (turns started from either the computer or the phone), questions are sent as WeCom cards; when free-form answers are allowed, tap "write your own" or simply reply with text (while the current session has a pending question, a plain message is taken as the answer). Multiple questions are asked one by one; whichever side answers first wins; unanswered questions are cancelled on timeout. Background sessions are not supported.
 
  Credentials stay on the local machine, but setup does not mask the Secret input. See [security and data handling](SECURITY.md).
 

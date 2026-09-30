@@ -11,7 +11,7 @@ import { spawn, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { loadConfig, RUN_DIR, VERSION, validateCredentials, ensureToken, saveOwner } from "./config.mjs";
 import { resolveTerminal } from "./terminals.mjs";
-import { WeComTransport } from "./wecom.mjs";
+import { WeComTransport, MAX_ATTACHMENT_BYTES } from "./wecom.mjs";
 import { loadAliases } from "./aliases.mjs";
 const CFG = loadConfig();
 validateCredentials(CFG);
@@ -155,7 +155,7 @@ async function fetchInboxFile(m) {
     if (!local.startsWith(root + path.sep))
         throw new Error("附件不在收件目录");
     const stat = await fsp.stat(local);
-    if (!stat.isFile() || stat.size > 20 * 1024 * 1024)
+    if (!stat.isFile() || stat.size > MAX_ATTACHMENT_BYTES)
         throw new Error("附件超限");
     return local;
 }
@@ -1642,7 +1642,9 @@ async function handleModelPick(pick) {
     return applyModel(t, m);
 }
 // ---- 扩展弹窗转手机 ----
-const UI_KINDS = new Set(["confirm", "select", "input", "editor"]);
+const UI_KINDS = new Set(["confirm", "select", "input", "editor", "question"]);
+// 提问工具（question / questionnaire）允许手机直接回文字作答：记录等待文字的请求。
+const WRITE_LABEL = "✏️ 自己写（直接回复文字）";
 const uiPending = new Map();
 const durLabel = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.max(1, Math.round(ms / 1000))} 秒`);
 // 弹窗内容放进代码块：避免 `$...$` 被企微渲染成公式、Markdown 符号被解释。
@@ -1678,12 +1680,13 @@ function openUiPrompt(t, req, reply) {
         sendText(plainText({ head: `✅ 已自动允许 · ${who}`, body: detail, foot: "remoteConfirm 为 allow，不再询问" }));
         return;
     }
-    const e = { reqId, t, kind, title, reply, done: false };
+    const e = { reqId, t, kind, title, reply, done: false, limitMs: req.limitMs };
     // 扩展自带更短的超时：Pi 到点按扩展默认值处理，我们只回收卡片。
     const own = req.limitMs > 0 && req.limitMs < UI_TIMEOUT_MS;
     const wait = own ? req.limitMs : UI_TIMEOUT_MS;
     const after = own ? "按扩展默认处理" : uiAfterLabel(kind);
-    e.timer = setTimeout(() => {
+    e.wait = wait;
+    e.expire = () => {
         if (own) {
             if (closeUiPrompt(e))
                 sendText(plainText({ head: `⏱️ 请求已超时 · ${who}`, body: uiFence(title), foot: "已按扩展默认值处理，任务继续运行" }));
@@ -1692,7 +1695,8 @@ function openUiPrompt(t, req, reply) {
         const answer = uiTimeoutAnswer(kind);
         if (settleUiPrompt(e, answer))
             sendText(plainText({ head: `⏱️ 超时未处理，已${uiAfterLabel(kind)} · ${who}`, body: uiFence(title), foot: "任务继续运行，完成后推送" }));
-    }, wait);
+    };
+    e.timer = setTimeout(e.expire, wait);
     e.timer.unref?.();
     uiPending.set(reqId, e);
     const limit = durLabel(wait);
@@ -1702,6 +1706,31 @@ function openUiPrompt(t, req, reply) {
         return;
     }
     let options;
+    if (kind === "question") {
+        const list = (Array.isArray(req.options) ? req.options : []).filter((x) => typeof x === "string");
+        const descs = Array.isArray(req.descriptions) ? req.descriptions : [];
+        const room = VOTE_OPT_MAX - (req.allowText ? 2 : 1);
+        e.allowText = !!req.allowText;
+        // 只发卡片：说明并入选项文字。
+        options = list.slice(0, room).map((v, i) => [`${i + 1}. ${v}${descs[i] ? ` · ${descs[i]}` : ""}`, { index: i + 1, value: v }]);
+        if (e.allowText)
+            options.push([WRITE_LABEL, { write: true }]);
+        options.push(["取消", { cancelled: true }]);
+        if (list.length > room)
+            e.more = list.length - room;
+        const hint = [e.allowText ? "可直接回复文字" : "", e.more ? `另 ${e.more} 项请到电脑选` : "", `${limit}内未答将${after}`].filter(Boolean).join(" · ");
+        const card = {
+            card_type: "vote_interaction",
+            title: clip(`❓ ${title}`, 26),
+            desc: clip(hint, 30),
+            options: options.map(([text, answer]) => ({ id: registerPick({ act: "ui", reqId, answer, label: text }), text: clip(text, 60) })),
+            mode: 0,
+            submit_text: "回答",
+            task_id: taskId("ui"),
+        };
+        void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: clip(title, 80), foot: `${e.allowText ? "可直接回复文字作答，或" : "请"}到电脑上处理 · ${limit}内未答将${after}` })));
+        return;
+    }
     if (kind === "confirm") {
         options = [["允许", { confirmed: true }], ["拒绝", { confirmed: false }]];
     }
@@ -1748,10 +1777,32 @@ function dropUiPrompts(t, answer = null) {
         if (e.t === t)
             answer ? settleUiPrompt(e, answer) : closeUiPrompt(e);
 }
+/** 手机回文字：交给当前会话最早一个允许文字作答的提问；没有则返回 null 照常投递。 */
+function takeTextAnswer(text) {
+    const t = currentTarget();
+    const open = [...uiPending.values()].filter((x) => x.kind === "question" && x.allowText);
+    // 点过「自己写」的优先（最近一次），否则只回答当前会话的提问。
+    const e = open.filter((x) => x.awaitText).sort((a, b) => b.awaitText - a.awaitText)[0] || open.find((x) => t && x.t === t);
+    if (!e || !text.trim())
+        return null;
+    settleUiPrompt(e, { custom: true, value: text.trim() });
+    log(`ui answered by phone text target=${e.t.key}`);
+    return plainText({ head: `✅ 已回答 · ${e.t.label()}`, body: uiFence(`${e.title}\n→ ${text.trim()}`), foot: "任务继续运行，完成后推送" });
+}
 function handleUiPick(pick) {
     const e = uiPending.get(pick.reqId);
     if (!e)
         return "这个请求已经处理过（已超时、已在电脑上回答或会话已结束）。";
+    if (pick.answer.write) {
+        e.awaitText = Date.now();
+        // 点了「自己写」：重新计时，留出打字时间（扩展自带超时的由 Pi 决定，不延长）。
+        if (!(e.limitMs > 0)) {
+            clearTimeout(e.timer);
+            e.timer = setTimeout(e.expire, e.wait);
+            e.timer.unref?.();
+        }
+        return plainText({ head: `✏️ 请直接回复文字 · ${e.t.label()}`, body: uiFence(e.title), foot: "下一条非命令消息将作为答案" });
+    }
     settleUiPrompt(e, pick.answer);
     log(`ui answered by phone target=${e.t.key} ${JSON.stringify(pick.label)}`);
     const refused = pick.answer.confirmed === false || pick.answer.cancelled;
@@ -2012,6 +2063,11 @@ async function handleCardCallback({ taskId, optionId }) {
 async function handleCommand(text, media = [], ack = { media: false }) {
     const raw = text.trim();
     const parsed = parseCmd(raw);
+    if (!parsed && !media.length) {
+        const answered = takeTextAnswer(raw);
+        if (answered)
+            return answered;
+    }
     if (!parsed) {
         const t = currentTarget();
         if (!t) {

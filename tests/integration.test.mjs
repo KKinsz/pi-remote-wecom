@@ -260,6 +260,22 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await api('/ui-done',{key:a.key,reqId:'tui-ui-2'});
   pickUi(localCard,'允许'); await until(()=>sent.filter(x=>x.markdown?.content.includes('这个请求已经处理过')).length===2);
   assert.equal((await api('/ui-request',{key:a.key,reqId:'x',kind:'custom'})).error,'bad ui request');
+  // Question tool: numbered options + write-your-own; card pick and free-text reply both answer it.
+  await api('/ui-request',{key:a.key,reqId:'tui-q-1',kind:'question',title:'用哪个库？',options:['React','Vue'],descriptions:['生态大',''],allowText:true});
+  const qCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('用哪个库')).at(-1)?.template_card);
+  assert.deepEqual(qCard.checkbox.option_list.map(o=>o.text),['1. React · 生态大','2. Vue','✏️ 自己写（直接回复文字）','取消']);
+  assert.match(qCard.main_title.desc,/可直接回复文字/);
+  assert.ok(!sent.some(x=>x.markdown?.content.includes('需要回答'))); // 只发卡片
+  pickUi(qCard,'2. Vue');
+  const qa=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
+  assert.deepEqual(qa,{type:'ui_answer',reqId:'tui-q-1',index:2,value:'Vue'});
+  await api('/ui-request',{key:a.key,reqId:'tui-q-2',kind:'question',title:'叫什么？',options:['默认'],allowText:true});
+  const q2Card=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('叫什么')).at(-1)?.template_card);
+  pickUi(q2Card,'✏️ 自己写（直接回复文字）');
+  await until(()=>sent.some(x=>x.markdown?.content.includes('请直接回复文字')));
+  assert.match((await api('/command',{text:'小明'})).reply,/已回答[\s\S]*→ 小明/);
+  const qa2=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
+  assert.deepEqual(qa2,{type:'ui_answer',reqId:'tui-q-2',custom:true,value:'小明'});
   const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,7); // 2 + 2 alias + 3 confirm sessions
   assert.equal(all.targets.filter(x=>x.kind==='tui').length,2);
   assert.equal(errors,'');

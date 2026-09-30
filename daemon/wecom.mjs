@@ -6,6 +6,11 @@ import {WELCOME_FILE, BIND_FILE, BIND_MAX_FAILURES} from './config.mjs';
 
 export const PENDING_MEDIA_TTL_MS = 5 * 60 * 1000;
 export const MARKDOWN_MAX_BYTES = 20_000;
+// 企微回调侧上限。官方文档（开发者中心「接收消息」）表述为「仅支持 100M 大小以内的文件
+// 与视频回调」，未给出精确字节定义；本项目按 100 MiB（104,857,600 字节）实现。
+// 该检查发生在完整下载并解密之后（SDK 的 downloadFile 返回整个 Buffer），因此它只能
+// 拦住超限结果继续落盘，并不能降低下载/解密期间的峰值内存。
+export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MARKDOWN_ATTACHMENT_NOTICE = '正文超过企微单条消息上限，已作为 Markdown 附件发送。';
 
 // Keep one Markdown message below the project's 20,000-byte safety limit.
@@ -380,16 +385,37 @@ export class WeComTransport {
     const dir = this.config.inboxDir.replace(/^~(?=\/|$)/, process.env.HOME);
     fs.mkdirSync(dir, {recursive: true, mode: 0o700});
     const media = [];
-    for (const item of parts.media) {
-      const url = new URL(item.url);
-      if (url.protocol !== 'https:') throw new Error('invalid media URL');
-      const {buffer, filename} = await this.client.downloadFile(item.url, item.aeskey);
-      if (buffer.length > 20 * 1024 * 1024) throw new Error('file too large');
-      const name = (filename || (item.kind === 'image' ? '图片.png' : '附件.bin')).replace(/[\p{Cc}\p{Cf}/\\]/gu, '_').slice(0, 100);
-      const local = path.join(dir, `${crypto.randomUUID()}-${name}`);
-      fs.writeFileSync(local, buffer, {mode: 0o600, flag: 'wx'});
-      media.push({local, name, kind: item.kind, bytes: buffer.length});
-    }
+    // 本批独占创建的文件路径。登记时机早于写入完成，任何失败出口都能据此回滚。
+    const owned = new Set();
+    // 整条消息要么全投递、要么全不投递：中途失败时回滚本批已落盘的文件。
+    // 这些文件从未进入 pendingMedia，超时清理覆盖不到，只能在这里删除。
+    // 这是异常路径下的尽力回滚，不是崩溃一致性事务：进程被杀、unlink 自身失败等
+    // 仍可能留下文件（后者记日志），不应理解为无条件保证。
+    const discard = () => {for (const local of owned) {try {fs.unlinkSync(local);}
+      catch (error) {if (error?.code !== 'ENOENT') this.log('失败批次附件回滚失败，请检查收件目录');}}};
+    try {
+      for (const item of parts.media) {
+        const url = new URL(item.url);
+        if (url.protocol !== 'https:') throw new Error('invalid media URL');
+        const {buffer, filename} = await this.client.downloadFile(item.url, item.aeskey);
+        if (buffer.length > MAX_ATTACHMENT_BYTES) throw new Error('file too large');
+        const name = (filename || (item.kind === 'image' ? '图片.png' : '附件.bin')).replace(/[\p{Cc}\p{Cf}/\\]/gu, '_').slice(0, 100);
+        const local = path.join(dir, `${crypto.randomUUID()}-${name}`);
+        // 先独占创建并登记归属，再写入：写入本身可能中途失败（如 ENOSPC），
+        // 那时文件已存在但还没进入 media，只有提前登记才能被 discard 回收。
+        // 'wx' 失败（如 EEXIST）意味着文件不是本批创建的，不得登记、也不得删除。
+        const fd = fs.openSync(local, 'wx', 0o600);
+        owned.add(local);
+        try {fs.writeFileSync(fd, buffer);}
+        catch (error) {
+          // 关闭失败不得掩盖真正的写入错误；fd 最迟随进程退出释放。
+          try {fs.closeSync(fd);} catch {}
+          throw error;
+        }
+        fs.closeSync(fd);
+        media.push({local, name, kind: item.kind, bytes: buffer.length});
+      }
+    } catch (error) {discard(); throw error;}
     return {text: parts.text, media};
   }
 }

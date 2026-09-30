@@ -108,3 +108,75 @@ test('TUI 扩展：手机轮次的弹窗转到手机，谁先答用谁；本地�
   const reqs=calls.filter(x=>x.endpoint==='/ui-request'); assert.equal(reqs[3].body.reqId,reqs[2].body.reqId);
   local[3].resolve(true); assert.equal(await p3,true);
 });
+test('TUI 扩展：question / questionnaire 工具（ui.custom）转手机，按工具原结果形状交回',async t=>{
+  const {RUN_DIR}=await import('../daemon/config.mjs');const dir=RUN_DIR;fs.mkdirSync(dir,{recursive:true});
+  const previous=process.env.PI_REMOTE_HOME;process.env.PI_REMOTE_HOME=dir;
+  fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({localPort:18778}));fs.writeFileSync(path.join(dir,'.token'),'token');
+  const originalFetch=globalThis.fetch;const polls=[],calls=[];
+  globalThis.fetch=async(url,options)=>{
+    const endpoint=new URL(url).pathname;const body=options.body?JSON.parse(options.body):{};calls.push({endpoint,body});
+    if(endpoint==='/register')return Response.json({key:'t1',tunnel:true});
+    if(endpoint==='/poll')return new Promise((resolve,reject)=>{
+      const onAbort=()=>reject(Error('aborted'));options.signal.addEventListener('abort',onAbort,{once:true});
+      polls.push({reply:messages=>{options.signal.removeEventListener('abort',onAbort);resolve(Response.json({messages,tunnel:true}));}});
+    });
+    return Response.json({ok:true});
+  };
+  // Fake custom(): the factory receives done; the test can also finish it locally.
+  const shown=[];
+  const ui={setStatus(){},notify(){},confirm:async()=>true,select:async()=>undefined,
+    custom:(factory)=>new Promise(resolve=>{const s={done:v=>{s.closed=true;resolve(v);}};factory({},{},{},s.done);shown.push(s);})};
+  const hooks=new Map();
+  const extension=(await import(`../extensions/remote.ts?q=${Date.now()}`)).default;
+  const ctx={mode:'tui',cwd:dir,model:{id:'m'},getContextUsage:()=>null,isIdle:()=>true,abort(){},ui,
+    sessionManager:{getSessionFile:()=>'',getSessionId:()=>'S'}};
+  extension({on:(name,fn)=>hooks.set(name,fn),getSessionName:()=>'S',sendUserMessage(){}});
+  t.after(async()=>{await hooks.get('session_shutdown')?.();globalThis.fetch=originalFetch;if(previous===undefined)delete process.env.PI_REMOTE_HOME;else process.env.PI_REMOTE_HOME=previous;});
+  await hooks.get('session_start')({},ctx);await until(()=>polls.length===1);
+  const reqs=()=>calls.filter(x=>x.endpoint==='/ui-request').map(x=>x.body);
+  // Local (desktop) turn: question is also forwarded; the phone answers.
+  await hooks.get('before_agent_start')({prompt:'本地'});
+  await hooks.get('tool_execution_start')({toolCallId:'c0',toolName:'question',args:{question:'本地问',options:[{label:'A'}]}});
+  const p0=ui.custom(()=>({}));await until(()=>reqs().length===1);
+  polls[0].reply([{type:'ui_answer',reqId:reqs()[0].reqId,index:1,value:'A'}]);
+  assert.deepEqual(await p0,{answer:'A',wasCustom:false,index:1});
+  calls.length=0; // 以下下标从 0 重新计
+  await hooks.get('agent_settled')({},ctx);
+  // Phone turn, question: phone picks option 2.
+  await until(()=>polls.length===2);polls[1].reply([{text:'手机任务'}]);await until(()=>polls.length===3);
+  await hooks.get('before_agent_start')({prompt:'手机任务'});
+  await hooks.get('tool_execution_start')({toolCallId:'c1',toolName:'question',args:{question:'用哪个库？',options:[{label:'React',description:'生态大'},{label:'Vue'}]}});
+  const p1=ui.custom(()=>({}));await until(()=>reqs().length===1);
+  assert.equal(reqs()[0].kind,'question');assert.deepEqual(reqs()[0].options,['React','Vue']);assert.equal(reqs()[0].allowText,true);
+  assert.deepEqual(reqs()[0].descriptions,['生态大','']);
+  polls[2].reply([{type:'ui_answer',reqId:reqs()[0].reqId,index:2,value:'Vue'}]);
+  assert.deepEqual(await p1,{answer:'Vue',wasCustom:false,index:2});
+  await hooks.get('tool_execution_end')({toolCallId:'c1'});
+  // Phone writes free text.
+  await hooks.get('tool_execution_start')({toolCallId:'c2',toolName:'question',args:{question:'名字？',options:[{label:'默认'}]}});
+  const p2=ui.custom(()=>({}));await until(()=>reqs().length===2);
+  polls[3].reply([{type:'ui_answer',reqId:reqs()[1].reqId,custom:true,value:' 小明 '}]);
+  assert.deepEqual(await p2,{answer:'小明',wasCustom:true});
+  await hooks.get('tool_execution_end')({toolCallId:'c2'});
+  // Questionnaire: two questions asked one after another, answers returned in questionnaire shape.
+  const qs=[{id:'scope',prompt:'范围？',options:[{value:'all',label:'全部'},{value:'part',label:'部分'}]},{id:'pri',label:'优先级',prompt:'优先级？',options:[{value:'p0',label:'P0'}],allowOther:false}];
+  await hooks.get('tool_execution_start')({toolCallId:'c3',toolName:'questionnaire',args:{questions:qs}});
+  const p3=ui.custom(()=>({}));await until(()=>reqs().length===3);
+  assert.equal(reqs()[2].title,'（1/2）范围？');
+  polls[4].reply([{type:'ui_answer',reqId:reqs()[2].reqId,index:2,value:'部分'}]);
+  await until(()=>reqs().length===4);assert.equal(reqs()[3].allowText,false);
+  polls[5].reply([{type:'ui_answer',reqId:reqs()[3].reqId,index:1,value:'P0'}]);
+  const r3=await p3;
+  assert.equal(r3.cancelled,false);
+  assert.deepEqual(r3.answers,[{id:'scope',value:'part',label:'部分',wasCustom:false,index:2},{id:'pri',value:'p0',label:'P0',wasCustom:false,index:1}]);
+  assert.deepEqual(r3.questions.map(q=>q.label),['Q1','优先级']);
+  await hooks.get('tool_execution_end')({toolCallId:'c3'});
+  // Terminal answers first: phone card retired via /ui-done.
+  await hooks.get('tool_execution_start')({toolCallId:'c4',toolName:'question',args:{question:'电脑答',options:[{label:'X'}]}});
+  const p4=ui.custom(()=>({}));await until(()=>reqs().length===5);
+  shown.at(-1).done({answer:'X',wasCustom:false,index:1});
+  assert.deepEqual(await p4,{answer:'X',wasCustom:false,index:1});
+  await until(()=>calls.some(x=>x.endpoint==='/ui-done'&&x.body.reqId===reqs()[4].reqId));
+  // Unrelated custom() (no question tool running) is untouched.
+  const p5=ui.custom(()=>({}));await tick();assert.equal(reqs().length,5);shown.at(-1).done('ok');assert.equal(await p5,'ok');
+});

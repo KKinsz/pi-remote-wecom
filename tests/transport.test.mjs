@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import {EventEmitter} from 'node:events';
-import {WeComTransport, PENDING_MEDIA_TTL_MS, selectedIds, disabledSelectionCard, splitMarkdown} from '../daemon/wecom.mjs';
+import {WeComTransport, PENDING_MEDIA_TTL_MS, MAX_ATTACHMENT_BYTES, selectedIds, disabledSelectionCard, splitMarkdown} from '../daemon/wecom.mjs';
 import {plist} from '../daemon/service.mjs';
 const turn = () => new Promise(r => setTimeout(r, 15));
 function fixture(t, handlers = {}) {
@@ -103,6 +104,119 @@ test('断网发件箱持久化，重新连接后发送，确认后删除', async
   assert.equal(f.sent.length, 0); assert.equal(f.transport.queueFiles().length,1);
   f.transport.connected = true; await f.transport.flush();
   assert.equal(f.sent[0].body.markdown.content,'离线结果'); assert.equal(f.transport.queueFiles().length,0);
+});
+test('附件单件上限为企微回调上限：恰好 100MB 受理，超 1 字节整条不投递', async t => {
+  assert.equal(MAX_ATTACHMENT_BYTES, 100 * 1024 * 1024);
+  const delivered = [];
+  const f = fixture(t, {onMessage: async (text, files) => {delivered.push({text, files}); return 'ok';}});
+  f.transport.connected = true;
+  f.client.downloadFile = async () => ({buffer: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1), filename: 'big.bin'});
+  // 带正文的 mixed 消息：若超限件被错误受理，onMessage 会被调用，断言才有判别力。
+  f.transport.accept(f.frame('over','看这个文件',{msgtype:'mixed',mixed:{msg_item:[
+    {msgtype:'text',text:{content:'看这个文件'}},
+    {msgtype:'file',file:{url:'https://example.test/b',aeskey:'test'}}]}}));
+  await f.transport.inbound;
+  assert.equal(f.transport.pendingMedia.length, 0);
+  assert.match(f.sent.map(item => item.body.markdown?.content || '').join('\n'), /附件下载失败/);
+  assert.deepEqual(fs.readdirSync(f.transport.config.inboxDir), []);
+  // 超限批次不得进入 Pi：provider 未收到任何调用。
+  assert.equal(delivered.length, 0);
+  // 上限本身是允许值：拒绝条件是 > 而不是 >=。
+  const ok = fixture(t);
+  ok.transport.connected = true;
+  ok.client.downloadFile = async () => ({buffer: Buffer.alloc(MAX_ATTACHMENT_BYTES), filename: 'limit.bin'});
+  ok.transport.accept(ok.frame('at-limit','',{msgtype:'file',file:{url:'https://example.test/b',aeskey:'test'}}));
+  await ok.transport.inbound;
+  assert.equal(ok.transport.pendingMedia.length, 1);
+});
+test('批次中途失败时回滚本批已落盘附件，不留下孤儿文件', async t => {
+  const f = fixture(t); const inbox = f.transport.config.inboxDir;
+  let n = 0;
+  f.client.downloadFile = async () => {
+    if (++n === 1) return {buffer: Buffer.from('first'), filename: 'first.bin'};
+    throw new Error('simulated failure');
+  };
+  // 前一件成功、后一件失败：整条不投递，已写出的那个必须被删掉。
+  const body = {msgid: 'm', aibotid: 'test-bot', chattype: 'single', from: {userid: 'owner'},
+    msgtype: 'mixed', mixed: {msg_item: [
+      {msgtype: 'text', text: {content: '看这两个文件'}},
+      {msgtype: 'file', file: {url: 'https://example.test/1', aeskey: 'k'}},
+      {msgtype: 'file', file: {url: 'https://example.test/2', aeskey: 'k'}},
+    ]}};
+  await assert.rejects(f.transport.prepare(body), /simulated failure/);
+  assert.deepEqual(fs.readdirSync(inbox), []);
+});
+test('写入中途失败（如 ENOSPC）回滚本批文件，不留下残片', async t => {
+  const f = fixture(t); const inbox = f.transport.config.inboxDir;
+  let n = 0;
+  f.client.downloadFile = async () => ({buffer: Buffer.from('first'), filename: `f${++n}.bin`});
+  // 第二件：先真实写入部分字节再抛错，模拟「文件已创建且不完整」的中途失败。
+  const realWriteFileSync = fs.writeFileSync;
+  let calls = 0;
+  fs.writeFileSync = (fd, data, ...rest) => {
+    if (++calls === 2) {
+      realWriteFileSync(fd, Buffer.from(data).subarray(0, 1));
+      const error = new Error('ENOSPC during write');
+      error.code = 'ENOSPC';
+      throw error;
+    }
+    return realWriteFileSync(fd, data, ...rest);
+  };
+  t.after(() => {fs.writeFileSync = realWriteFileSync;});
+  const body = {msgid: 'm', aibotid: 'test-bot', chattype: 'single', from: {userid: 'owner'},
+    msgtype: 'mixed', mixed: {msg_item: [
+      {msgtype: 'file', file: {url: 'https://example.test/1', aeskey: 'k'}},
+      {msgtype: 'file', file: {url: 'https://example.test/2', aeskey: 'k'}},
+    ]}};
+  await assert.rejects(f.transport.prepare(body), /ENOSPC/);
+  fs.writeFileSync = realWriteFileSync;
+  // 第一件（已写完）与第二件（半写残片）都必须被清掉。
+  assert.deepEqual(fs.readdirSync(inbox), []);
+  assert.equal(calls, 2);
+});
+test('独占创建失败时不得删除已存在的同名文件（EEXIST 不误删）', async t => {
+  const f = fixture(t); const inbox = f.transport.config.inboxDir;
+  fs.mkdirSync(inbox, {recursive: true});
+  // 伪造一个由上一批创建的文件，并让本批算出同名路径，使 openSync('wx') 以 EEXIST 失败。
+  const realRandomUUID = crypto.randomUUID;
+  crypto.randomUUID = () => 'fixed';
+  t.after(() => {crypto.randomUUID = realRandomUUID;});
+  const occupied = path.join(inbox, 'fixed-occupied.bin');
+  fs.writeFileSync(occupied, 'not ours');
+  f.client.downloadFile = async () => ({buffer: Buffer.from('x'), filename: 'occupied.bin'});
+  await assert.rejects(f.transport.prepare({msgid: 'm', aibotid: 'test-bot', chattype: 'single',
+    from: {userid: 'owner'}, msgtype: 'file', file: {url: 'https://example.test/1', aeskey: 'k'}}),
+    error => error.code === 'EEXIST');
+  crypto.randomUUID = realRandomUUID;
+  // 该文件不是本批创建的，必须原样保留。
+  assert.deepEqual(fs.readdirSync(inbox), ['fixed-occupied.bin']);
+  assert.equal(fs.readFileSync(occupied, 'utf8'), 'not ours');
+});
+test('多件全部成功：落盘内容、长度与权限一致，整批返回', async t => {
+  const f = fixture(t);
+  const payloads = ['alpha', 'beta-payload', 'g']; // 长度不一，防止只验证文件名
+  let n = 0;
+  f.client.downloadFile = async () => ({buffer: Buffer.from(payloads[n]), filename: `p${++n}.bin`});
+  const body = {msgid: 'm', aibotid: 'test-bot', chattype: 'single', from: {userid: 'owner'},
+    msgtype: 'mixed', mixed: {msg_item: payloads.map((_, i) => ({msgtype: 'file', file: {url: `https://example.test/${i}`, aeskey: 'k'}}))}};
+  const {text, media} = await f.transport.prepare(body);
+  assert.equal(text, '');
+  assert.equal(media.length, 3);
+  // 两阶段 fd 写入后仍必须保证：字节数一致、内容完整、权限 600。
+  media.forEach((item, i) => {
+    assert.equal(item.bytes, Buffer.byteLength(payloads[i]));
+    assert.equal(fs.readFileSync(item.local, 'utf8'), payloads[i]);
+    assert.equal(fs.statSync(item.local).size, Buffer.byteLength(payloads[i]));
+    assert.equal(fs.statSync(item.local).mode & 0o777, 0o600);
+  });
+});
+test('投递侧与下载侧共用同一上限，不退回裸常量', async t => {
+  // daemon.mjs 在模块顶层启动服务，无法 import；这里用源码静态检查守住两侧一致。
+  // 目的：防止将来只改一侧，或把投递侧退回 20MB 裸常量而下载侧测试仍然全绿。
+  const source = fs.readFileSync(new URL('../daemon/daemon.mjs', import.meta.url), 'utf8');
+  assert.match(source, /import \{[^}]*MAX_ATTACHMENT_BYTES[^}]*\} from "\.\/wecom\.mjs"/);
+  assert.match(source, /stat\.size > MAX_ATTACHMENT_BYTES/);
+  assert.doesNotMatch(source, /20 \* 1024 \* 1024/);
 });
 test('附件先下载，查询不消费，后续投递成功才消费', async t => {
   const calls = []; const f = fixture(t, {onMessage: async (text, files, ack) => {calls.push({text, files}); ack.media = text !== '活跃会话'; return 'ok';}});
