@@ -4,6 +4,8 @@ This repository can be distributed as a Pi package through Git or npm. Follow th
 
 ## One checkout, two remotes
 
+Local `main` tracks `origin/main` (CNB) and is the development base: `git switch main && git pull --ff-only`, branch from it, and fast-forward it after merging. `codex/public-release` is the only local branch for GitHub history; never merge it into `main` or the reverse.
+
 Maintain one codebase in one local checkout. Keep `origin` pointing to the existing CNB repository and add `github` for the public repository. Do not change the existing origin URL or configure multiple push URLs on it: each destination should be explicit.
 
 ```text

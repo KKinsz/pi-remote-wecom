@@ -7,7 +7,7 @@
   "tabTitleEnabled": true,
   "remoteConfirm": "ask-then-allow",
   "remoteConfirmTimeoutMs": 180000,
-  "nameWaitMs": 3000,
+  "nameWaitMs": 5000,
   "kittySocket": "",
   "tmuxSession": "pi"
 }

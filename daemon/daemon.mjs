@@ -27,7 +27,7 @@ const OUT_DIR = path.join(DIR, "out");
 const PORT = CFG.localPort;
 const HOST = "127.0.0.1";
 const SYNC_WINDOW_MS = 2000;
-const NAME_WAIT_MS = Number.isFinite(CFG.nameWaitMs) ? CFG.nameWaitMs : 3000;
+const NAME_WAIT_MS = Number.isFinite(CFG.nameWaitMs) ? CFG.nameWaitMs : 5000;
 const RPC_IDLE_REAP_MS = 2 * 60 * 60000;
 const SILENCE_STEPS_MS = [10 * 60000, 30 * 60000, 60 * 60000];
 const HIST_LIST = 15;
@@ -437,7 +437,7 @@ class RpcTarget extends Target {
             args.push("--name", this.name);
         this.proc = spawn(CFG.piBin, args, {
             cwd: this.cwd,
-            env: { ...process.env, PI_CODING_AGENT_DIR: CFG.agentDir },
+            env: { ...process.env, PI_CODING_AGENT_DIR: CFG.agentDir, PI_REMOTE_BACKGROUND: "1" },
             stdio: ["pipe", "pipe", "pipe"],
         });
         this.proc.stdout.on("data", (c) => this._onStdout(c));
@@ -537,6 +537,10 @@ class RpcTarget extends Target {
             if (UI_KINDS.has(rec.method) && typeof rec.id === "string") {
                 openUiPrompt(this, { reqId: rec.id, kind: rec.method, title: rec.title, message: rec.message, options: rec.options, limitMs: rec.timeout }, (answer) => this.uiRespond(rec.id, answer));
             }
+            return;
+        }
+        if (rec.type === "session_info_changed") {
+            this.name = rec.name ? stripCtrl(String(rec.name)) : "";
             return;
         }
         const r = this.run;
@@ -1386,6 +1390,7 @@ const NL_ALIASES = [
     ["帮助", "help", false],
     ["活跃会话", "ls", false],
     ["查询活跃会话", "ls", false],
+    ["切换会话", "ls", false],
     ["历史会话", "h", true],
     ["查询历史会话", "h", true],
     ["创建会话", "n", true],
@@ -1810,9 +1815,9 @@ async function finishCreate(t, msg, media, ack, note = "") {
             r = { notDelivered: true, error: e.message };
         }
         // autoName === false: this session will never be named automatically; undefined (older extension) keeps waiting.
-        if (!r?.notDelivered && t.kind === "tui" && !t.name && t.autoName === false)
+        if (!r?.notDelivered && !t.name && t.autoName === false)
             log("创建会话 未开自动命名，跳过等待会话名");
-        else if (!r?.notDelivered && t.kind === "tui" && !t.name) {
+        else if (!r?.notDelivered && (t.kind === "tui" || t.kind === "rpc") && !t.name) {
             const t0 = Date.now();
             while (!t.name && Date.now() - t0 < NAME_WAIT_MS)
                 await new Promise((res) => setTimeout(res, 100));
@@ -1831,8 +1836,20 @@ async function finishCreate(t, msg, media, ack, note = "") {
     }
     return buildCreatedCard(t, note);
 }
+// 后台会话同样由随包命名模块命名；未开命名或未选命名模型时不等会话名。
+function backgroundNaming() {
+    if (!CFG.tabTitleEnabled)
+        return false;
+    try {
+        return !!JSON.parse(fs.readFileSync(path.join(CFG.agentDir, "pi-tab-title.json"), "utf8")).provider;
+    }
+    catch {
+        return false;
+    }
+}
 async function newBackground(cwd, msg, media, ack, note = "") {
     const rt = new RpcTarget({ cwd, name: "" });
+    rt.autoName = backgroundNaming();
     targets.set(rt.key, rt);
     try {
         await rt.start();

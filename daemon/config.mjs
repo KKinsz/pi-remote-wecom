@@ -14,7 +14,7 @@ export const DEFAULTS = {
   botId: '', secret: '', ownerUserId: '', localPort: 18778,
   terminal: 'auto', tmuxSession: 'pi', kittySocket: '', dirAliases: {home: '~'}, helpAliases: null,
   piBin: 'pi', statusKey: 'bridge', statusLabelFg: '240;240;240',
-  nameWaitMs: 3000, inboxDir: path.join(RUN_DIR, 'inbox'),
+  nameWaitMs: 5000, inboxDir: path.join(RUN_DIR, 'inbox'),
   agentDir: process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent'),
   tabTitleEnabled: true,
   // 手机发起的任务里，扩展弹窗转到企微卡片。confirm 超时策略：ask-then-allow（默认）| ask | allow。
