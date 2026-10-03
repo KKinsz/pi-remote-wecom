@@ -8,8 +8,8 @@ import {EventEmitter} from 'node:events';
 import {WeComTransport, PENDING_MEDIA_TTL_MS, MAX_ATTACHMENT_BYTES, selectedIds, disabledSelectionCard, splitMarkdown} from '../daemon/wecom.mjs';
 import {plist} from '../daemon/service.mjs';
 const turn = () => new Promise(r => setTimeout(r, 15));
-function fixture(t, handlers = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-wecom-test-'));
+function fixture(t, handlers = {}, reuseDir = null) {
+  const dir = reuseDir || fs.mkdtempSync(path.join(os.tmpdir(), 'pi-wecom-test-'));
   const client = new EventEmitter(); const sent = []; const updates = [];
   Object.assign(client, {connect() {}, disconnect() {},
     async sendMessage(to, body) {sent.push({to, body});},
@@ -18,7 +18,7 @@ function fixture(t, handlers = {}) {
   });
   const config = {botId: 'test-bot', secret: 'test-secret', ownerUserId: 'owner', inboxDir: path.join(dir, 'inbox')};
   const transport = new WeComTransport({config, dir, client, onMessage: async () => 'ok', onCard: async () => 'selected', ...handlers});
-  t.after(() => {transport.stop(); fs.rmSync(dir, {recursive: true, force: true});});
+  t.after(() => {transport.stop(); if (!reuseDir) fs.rmSync(dir, {recursive: true, force: true});});
   const frame = (id, text = '你好', extra = {}) => ({headers: {req_id: id}, body: {
     msgid: id, aibotid: 'test-bot', chattype: 'single', from: {userid: 'owner'},
     msgtype: 'text', text: {content: text}, ...extra,
@@ -292,6 +292,38 @@ test('连上后主动给主人发一次欢迎，重连不重复', async t => {
   const texts=f.sent.map(m=>m.body.markdown?.content);
   assert.deepEqual(texts,['Pi Remote 已连接，发送`帮助`查看命令。']);
   assert.equal(f.sent[0].to,'owner');
+});
+test('停机留下重启标记，新进程连上后主动通知一次，且不走欢迎去重', async t => {
+  const a = fixture(t);
+  a.transport.start();
+  a.client.emit('authenticated'); await turn();
+  a.transport.drain(); // 优雅退出
+  assert.ok(fs.existsSync(a.transport.restartFile), '退出前应留下标记');
+  const b = fixture(t, {}, a.dir);
+  b.transport.start();
+  b.client.emit('authenticated'); await turn();
+  assert.deepEqual(b.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已重启，企微已连接，发送`帮助`查看命令。']);
+  // 标记为一次性：同一进程内的后续重连不再重复通知。
+  b.client.emit('authenticated'); await turn();
+  assert.equal(b.sent.length, 1);
+  assert.equal(fs.existsSync(b.transport.restartFile), false);
+});
+test('单纯的网络重连不发重启通知；过期标记被丢弃', async t => {
+  const f = fixture(t); f.transport.start();
+  f.client.emit('authenticated'); await turn();
+  f.client.emit('reconnecting'); f.client.emit('authenticated'); await turn();
+  assert.deepEqual(f.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送`帮助`查看命令。']);
+  // 隔天才开机：不补发早已无关的通知。
+  const stale = fixture(t);
+  fs.writeFileSync(stale.transport.restartFile, JSON.stringify({at: Date.now() - 11 * 60 * 1000, botId: 'test-bot'}));
+  stale.transport.start(); stale.client.emit('authenticated'); await turn();
+  assert.deepEqual(stale.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送`帮助`查看命令。']);
+  assert.equal(fs.existsSync(stale.transport.restartFile), false);
+  // 换了机器人（换了配置）也不能把标记算在自己头上。
+  const other = fixture(t);
+  fs.writeFileSync(other.transport.restartFile, JSON.stringify({at: Date.now(), botId: 'another-bot'}));
+  other.transport.start(); other.client.emit('authenticated'); await turn();
+  assert.deepEqual(other.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送`帮助`查看命令。']);
 });
 test('未绑定：绑定码错误计次作废，正确码绑定首个发送者且不触达 Pi', async t => {
   const {createBindCode} = await import('../daemon/config.mjs');

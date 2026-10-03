@@ -4,6 +4,7 @@ import extension from '../vendor/tab-title/index.ts';
 import { isolateConfig } from './isolated-config.mjs';
 import {writeFileSync} from 'node:fs';
 import {join} from 'node:path';
+delete process.env.PI_REMOTE_BACKGROUND; // 在 pi remote 后台会话里跑测试时会被误判为 active
 const configDir = isolateConfig();
 writeFileSync(join(configDir, 'pi-tab-title.json'), JSON.stringify({version:1,provider:'tencent-copilot',model:'deepseek-v4.1-flash'}));
 

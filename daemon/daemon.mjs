@@ -1072,7 +1072,7 @@ function currentTarget() {
     }
     return null;
 }
-function renderList(subset, all, title) {
+function renderList(subset, all, title, hint = "") {
     const lines = subset.map((t) => {
         const i = all.indexOf(t);
         const bits = [`${num(i + 1)} ${t.label()}`];
@@ -1087,9 +1087,10 @@ function renderList(subset, all, title) {
         return bits.join(" · ");
     });
     return plainText({
-        head: `⚠️ 卡片发送失败 · ${title}`,
+        head: "⚠️ 卡片发送失败",
+        subject: title,
         body: lines.join("\n") || "（空）",
-        foot: "发送 `选择会话 序号` 直达，如 `选择会话 2`",
+        foot: "发送 `选择会话 序号` 直达，如 `选择会话 2`" + hint,
     });
 }
 function clip(s, n) {
@@ -1245,7 +1246,8 @@ function buildHistCard(rows) {
     const { total, matched, find } = histStat;
     if (find && !hist.length) {
         return plainText({
-            head: `🔍 历史检索 · “${clip(find, 16)}”`,
+            head: "🔍 历史检索",
+            subject: `“${clip(find, 16)}”`,
             body: "没有找到。只搜会话名和开场白，不搜全文。",
             foot: `已搜 ${total} 个 · 换个词，或发 \`历史会话\` 看最近 ${HIST_LIST} 条`,
         });
@@ -1254,7 +1256,7 @@ function buildHistCard(rows) {
         return plainText({
             head: "🗂️ 历史会话 · 0 个",
             body: "~/.pi/agent/sessions 下还没有会话文件。",
-            foot: "发送 `创建会话` 或 `创建后台会话` 新建",
+            foot: "发送 `创建会话` 新建",
         });
     }
     const options = hist.slice(0, VOTE_OPT_MAX).map((t) => selOpt(t));
@@ -1269,13 +1271,16 @@ function buildHistCard(rows) {
     };
     if (find && matched > options.length)
         log(`历史会话 检索 “${find}” 命中 ${matched} 条，列前 ${options.length}`);
-    return cardBlock(card, PICK_LEAD, () => renderList(hist, rows, find ? `检索“${find}”` : "历史会话"));
+    return cardBlock(card, PICK_LEAD, () => renderList(hist, rows, find ? `检索“${find}”` : "历史会话", find ? "" : " · 发「历史会话 关键词」搜索"));
 }
 const RULE = "---";
-function plainText({ head, body = "", foot = "", extra = "" }) {
+// 三段式：head 只放状态；subject（会话名/对象）作为三级标题置于正文首行；关键信息进 body；foot 只放元信息与引导。
+function plainText({ head, subject = "", body = "", foot = "", extra = "" }) {
     const parts = [`**${head}**`];
-    if (body)
-        parts.push("", RULE, "", body);
+    // 标题与正文之间补一行全角空格：企微会折叠连续空行，需要一个可见占位才能拉开间距。
+    const main = [subject ? `### 💬 ${subject}` : "", subject && body ? "\u3000" : "", body].filter(Boolean).join("\n\n");
+    if (main)
+        parts.push("", RULE, "", main);
     if (extra)
         parts.push("", extra);
     if (foot)
@@ -1329,15 +1334,16 @@ function fmtDone(t, run, stats) {
     const body = (run.lastText || "（无文本输出）").trim();
     const extra = "";
     const state = run.stopped ? "⚠️ 已中断" : "🏁 任务完成";
-    const head = `${state} · ${t.label()}`;
-    const full = plainText({ head, body, foot, extra });
+    const head = state;
+    const subject = t.label();
+    const full = plainText({ head, subject, body, foot, extra });
     const fullBytes = Buffer.byteLength(full);
     if (fullBytes <= PUSH_TEXT_MAX_BYTES)
         return full;
     const note = `字数超限，请查看 Markdown。`;
     log(`交付正文 ${fullBytes} UTF-8 字节 > ${PUSH_TEXT_MAX_BYTES} → 转 Markdown 文档`);
     return {
-        text: plainText({ head, body: note, foot, extra }),
+        text: plainText({ head, subject, body: note, foot, extra }),
         doc: {
             name: t.label(),
             cwd: t.cwd,
@@ -1346,6 +1352,7 @@ function fmtDone(t, run, stats) {
         },
         degrade: () => plainText({
             head,
+            subject,
             body: `${truncateUtf8(body, PUSH_TEXT_MAX_BYTES - 400)}\n\n…（共 ${body.length} 字，Markdown 文档上传失败，已截断）`,
             foot,
         }),
@@ -1378,11 +1385,12 @@ function fmtAccepted(t) {
     const foot = [`目录：${tilde(t.cwd)}`];
     if (t.model)
         foot.push(`模型：${t.model}`);
-    return plainText({ head: `⏳ 运行中 · ${t.label()}`, body: "任务已开始运行，完成后推送", foot: foot.join(" · ") });
+    return plainText({ head: "⏳ 任务运行中", subject: t.label(), body: "任务已开始运行，完成后推送", foot: foot.join(" · ") });
 }
 function fmtFail(t, run) {
     return plainText({
-        head: `⚠️ 任务失败 · ${t.label()}`,
+        head: "⚠️ 任务失败",
+        subject: t.label(),
         body: `错误：${run.error}`,
         foot: `目录：${tilde(t.cwd)} · 运行：${runFor(run)}`,
     });
@@ -1390,19 +1398,18 @@ function fmtFail(t, run) {
 function fmtAborted(t, run) {
     const why = run.aborted === "会话失联" ? "会话失联" : "Pi Bridge 重启";
     return plainText({
-        head: `⚠️ 任务中断 · ${t.label()}`,
+        head: "⚠️ 任务中断",
+        subject: t.label(),
         body: `${why}，这一轮的结果没能送回。电脑上的任务可能已经完成。`,
         foot: `目录：${tilde(t.cwd)} · 运行：${runFor(run)} · 发送 \`状态\` 查看`,
     });
 }
 function fmtNotDelivered(t, error) {
-    const foot = [`目录：${tilde(t.cwd)}`];
-    if (error)
-        foot.push(`原因：${String(error).slice(0, 60)}`);
     return plainText({
-        head: `⚠️ 未送达 · ${t.label()}`,
-        body: "这条消息没有进入会话，附件已保留。请重发。",
-        foot: foot.join(" · "),
+        head: "⚠️ 未送达",
+        subject: t.label(),
+        body: "这条消息没有进入会话，附件已保留。请重发。" + (error ? `\n\n原因：${String(error).slice(0, 60)}` : ""),
+        foot: `目录：${tilde(t.cwd)}`,
     });
 }
 async function deliverAndWait(t, text, ack) {
@@ -1481,7 +1488,7 @@ function watchAsync(t, run) {
         const body = sent >= SILENCE_STEPS_MS.length
             ? `${ran}，连续 ${step} 没有动作，可能卡住了，之后不再提醒。`
             : `${ran}，${step} 没有新动作${run.lastTool ? `，最后一个动作是 ${run.lastTool}` : ""}。`;
-        sendText(plainText({ head: `⏳ 运行中 · ${t.label()}`, body, foot: "发送 `状态` 查看详情，或 `停止` 停止" }));
+        sendText(plainText({ head: "⏳ 任务运行中", subject: t.label(), body, foot: "发送 `状态` 查看详情，或 `停止` 停止" }));
     }, 30000);
     run.wait().then(async () => {
         clearInterval(prog);
@@ -1502,7 +1509,7 @@ function watchAsync(t, run) {
         await trackedPush(msg);
     });
 }
-const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact"]);
+const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact", "restart"]);
 const NL_ALIASES = [
     ["帮助", "help", false],
     ["活跃会话", "ls", false],
@@ -1526,6 +1533,8 @@ const NL_ALIASES = [
     ["思考强度", "think", true],
     ["压缩会话", "compact", true],
     ["压缩", "compact", true],
+    ["重启服务", "restart", true],
+    ["重启", "restart", true],
 ].sort((a, b) => b[0].length - a[0].length);
 function parseNlAlias(body) {
     for (const [word, cmd, args] of NL_ALIASES) {
@@ -1550,7 +1559,7 @@ function parseCmd(text) {
         return nl;
     return parseBare(t);
 }
-const BARE_ARGS = new Set(["h", "n", "nb", "model", "cd", "think", "compact"]);
+const BARE_ARGS = new Set(["h", "n", "nb", "model", "cd", "think", "compact", "restart"]);
 function parseBare(t) {
     const m = t.match(/^([A-Za-z]+)(?:\s+([\s\S]*))?$/);
     if (!m)
@@ -1570,15 +1579,13 @@ const helpText = () => [
     "",
     "| 英文 | 中文 |",
     "|---|---|",
+    "| n | 创建会话 |",
     "| ls | 活跃会话 |",
     "| h | 历史会话 |",
-    "| h 关键词 | 历史会话 关键词 |",
-    "| n [目录] [消息] | 创建会话 [目录] [消息] |",
-    "| nb [目录] [消息] | 创建后台会话 [目录] [消息] |",
-    "| model [关键词] | 模型 [关键词] |",
-    "| think [强度] | 思考强度 [强度] |",
-    "| cd [别名] | 目录 [别名] |",
-    "| compact [说明] | 压缩 [说明] |",
+    "| model | 模型 |",
+    "| think | 思考强度 |",
+    "| cd | 目录 |",
+    "| compact | 压缩 |",
     "| status | 状态 |",
     "| stop | 停止 |",
     "| help | 帮助 |",
@@ -1588,8 +1595,9 @@ const helpText = () => [
     "",
     "**Tips**",
     "",
-    "`1. 在电脑 Pi 可通过 /remote 进行配置`",
-    "`2. 在电脑 Pi 可通过 /tabmodel 启用会话自动命名`",
+    "> 1. 电脑端 `/remote` 配置",
+    "> 2. 电脑端 `/tabmodel` 自动命名会话",
+    "> 3. 先发附件，5 分钟内补文字一并发送",
 ].join("\n");
 
 async function resolveNumber(n) {
@@ -1609,7 +1617,7 @@ async function resolveNumber(n) {
     }
     catch (e) {
         rt.close();
-        return { failed: plainText({ head: "⚠️ 打开历史会话失败", body: clip(t.name || t.hint || "会话", 40), foot: `原因：${String(e?.message || e).slice(0, 100)}` }) };
+        return { failed: plainText({ head: "⚠️ 打开历史会话失败", subject: clip(t.name || t.hint || "会话", 40), body: `原因：${String(e?.message || e).slice(0, 100)}` }) };
     }
     const i = numMap.findIndex((x) => x.key === t.key);
     if (i >= 0)
@@ -1700,7 +1708,8 @@ async function buildModelCard(t, find = "") {
     const hits = find ? modelMatches(all, find) : models;
     if (find && !hits.length) {
         return plainText({
-            head: `🔍 没有匹配的模型 · “${clip(find, 16)}”`,
+            head: "🔍 没有匹配的模型",
+            subject: `“${clip(find, 16)}”`,
             body: `共 ${all.length} 个已认证模型，没有找到包含该关键词的模型。`,
             foot: "发送 `模型` 查看全部",
         });
@@ -1723,13 +1732,14 @@ async function buildModelCard(t, find = "") {
         task_id: taskId("model"),
     };
     return cardBlock(card, "**请选择模型**", () => plainText({
-        head: `⚠️ 卡片发送失败 · 切换模型`,
+        head: "⚠️ 卡片发送失败",
+        subject: "切换模型",
         body: shown.map((m) => `${modelLabel(m)} · ${m.provider}${isCurrentModel(t, m) ? " · ← 当前" : ""}`).join("\n"),
         foot: "发送 `模型 模型名` 直接切换",
     }));
 }
 async function applyModel(t, m) {
-    const fail = (why) => plainText({ head: "⚠️ 切换模型失败", body: `${modelLabel(m)} · ${t.label()}`, foot: `原因：${String(why || "未知").slice(0, 80)} · 发送 \`模型\` 重试` });
+    const fail = (why) => plainText({ head: "⚠️ 切换模型失败", subject: `${modelLabel(m)} · ${t.label()}`, body: `原因：${String(why || "未知").slice(0, 80)}`, foot: "发送 `模型` 重试" });
     let r;
     try {
         r = await t.setModel(m);
@@ -1757,7 +1767,7 @@ function buildModelCardDone(t, m) {
         emph: { title: name },
         emphMax: EMPH_NAME_MAX,
         facts,
-        fallback: () => plainText({ head: "💡 切换模型", body: name, foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
+        fallback: () => plainText({ head: "💡 切换模型", subject: name, foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
     });
 }
 /** 卡片点选时找回会话：key 失效（重注册）则按 sessionId 找。 */
@@ -1792,12 +1802,12 @@ async function buildThinkCard(t, arg = "") {
         return plainText({ head: "⚠️ 读取思考强度失败", body: String(e?.message || e).slice(0, 120), foot: "稍后重试，或发送 `状态` 查看" });
     }
     if (!levels?.length) {
-        return plainText({ head: "🧠 当前模型不支持思考强度", body: `${t.model || "未知模型"} · ${t.label()}`, foot: "发送 `模型` 换一个支持推理的模型" });
+        return plainText({ head: "🧠 当前模型不支持思考强度", subject: `${t.model || "未知模型"} · ${t.label()}`, foot: "发送 `模型` 换一个支持推理的模型" });
     }
     if (arg) {
         const want = thinkArg(arg);
         if (!want || !levels.includes(want))
-            return plainText({ head: "⚠️ 切换思考强度失败", body: `当前模型不支持：${clip(arg, 20)}`, foot: `可选：${levels.join(" / ")}` });
+            return plainText({ head: "⚠️ 切换思考强度失败", body: `当前模型不支持：${clip(arg, 20)}\n\n可选：${levels.join(" / ")}` });
         return applyThinking(t, want);
     }
     const options = levels.slice(0, VOTE_OPT_MAX).map((l) => ({
@@ -1814,14 +1824,15 @@ async function buildThinkCard(t, arg = "") {
         task_id: taskId("think"),
     };
     return cardBlock(card, "**请选择思考强度**", () => plainText({
-        head: "⚠️ 卡片发送失败 · 切换思考强度",
+        head: "⚠️ 卡片发送失败",
+        subject: "切换思考强度",
         body: levels.map((l) => `${thinkLabel(l)}${l === current ? " · ← 当前" : ""}`).join("\n"),
         foot: "发送 `思考强度 high` 直接切换",
     }));
 }
 const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : String(n));
 async function compactCard(t, instructions) {
-    const fail = (why) => plainText({ head: "⚠️ 压缩会话失败", body: t.label(), foot: `原因：${String(why || "未知").slice(0, 80)}` });
+    const fail = (why) => plainText({ head: "⚠️ 压缩会话失败", subject: t.label(), body: `原因：${String(why || "未知").slice(0, 80)}` });
     if (t.busy)
         return fail("会话正在运行，请等任务结束或先 `停止`");
     let r;
@@ -1829,10 +1840,13 @@ async function compactCard(t, instructions) {
         r = await t.compact(instructions);
     }
     catch (e) {
-        return fail(e?.message || e);
+        r = { ok: false, error: e?.message || String(e) };
     }
-    if (!r?.ok)
+    if (!r?.ok) {
+        if (/Nothing to compact|too small|Already compacted/i.test(String(r?.error)))
+            return plainText({ head: "ℹ️ 无需压缩", subject: t.label(), body: "会话还很短，或刚压缩过，暂时没有可压缩的内容" });
         return fail(r?.error);
+    }
     log(`压缩会话 target=${t.key} ${r.before}→${r.after}`);
     const facts = [{ keyname: "会话", value: t.label() }];
     if (instructions)
@@ -1842,15 +1856,15 @@ async function compactCard(t, instructions) {
         tag: "compact",
         icon: "🗜️",
         title: "压缩会话",
-        desc: "已压缩，下一条消息生效",
+        desc: instructions ? "已压缩，下一条消息生效" : "已压缩，下一条消息生效 · 发「压缩 说明」指定保留重点",
         emph: { title: change },
         emphMax: EMPH_NAME_MAX,
         facts,
-        fallback: () => plainText({ head: "🗜️ 压缩会话", body: change, foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
+        fallback: () => plainText({ head: "🗜️ 压缩会话", subject: t.label(), body: change, foot: [instructions ? `重点：${instructions.slice(0, 40)}` : "", instructions ? "" : "发送 `压缩 说明` 指定保留重点"].filter(Boolean).join(" · ") }),
     });
 }
 async function applyThinking(t, level) {
-    const fail = (why) => plainText({ head: "⚠️ 切换思考强度失败", body: `${level} · ${t.label()}`, foot: `原因：${String(why || "未知").slice(0, 80)} · 发送 \`思考强度\` 重试` });
+    const fail = (why) => plainText({ head: "⚠️ 切换思考强度失败", subject: `${level} · ${t.label()}`, body: `原因：${String(why || "未知").slice(0, 80)}`, foot: "发送 `思考强度` 重试" });
     let r;
     try {
         r = await t.setThinking(level);
@@ -1874,7 +1888,7 @@ async function applyThinking(t, level) {
         emph: { title: thinkLabel(got) },
         emphMax: EMPH_NAME_MAX,
         facts,
-        fallback: () => plainText({ head: "🧠 切换思考强度", body: thinkLabel(got), foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
+        fallback: () => plainText({ head: "🧠 切换思考强度", subject: thinkLabel(got), foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
     });
 }
 function handleThinkPick(pick) {
@@ -1914,12 +1928,12 @@ function openUiPrompt(t, req, reply) {
     if (kind === "editor" || (kind === "input" && t.kind !== "tui")) {
         // 企微卡片不能输入文字、后台会话也无人在电脑前：直接取消，任务继续。
         reply({ cancelled: true });
-        sendText(plainText({ head: `⚠️ 扩展请求输入 · ${who}`, body: detail, foot: "手机上无法填写，已取消 · 需要时请到电脑上操作" }));
+        sendText(plainText({ head: "⚠️ 已取消扩展输入请求", subject: who, body: detail, foot: "手机上无法填写 · 需要时请到电脑上操作" }));
         return;
     }
     if (kind === "confirm" && UI_POLICY === "allow") {
         reply({ confirmed: true });
-        sendText(plainText({ head: `✅ 已自动允许 · ${who}`, body: detail, foot: "remoteConfirm 为 allow，不再询问" }));
+        sendText(plainText({ head: "✅ 已自动允许", subject: who, body: detail, foot: "remoteConfirm 为 allow，不再询问" }));
         return;
     }
     const e = { reqId, t, kind, title, reply, done: false, limitMs: req.limitMs };
@@ -1931,12 +1945,12 @@ function openUiPrompt(t, req, reply) {
     e.expire = () => {
         if (own) {
             if (closeUiPrompt(e))
-                sendText(plainText({ head: `⏱️ 请求已超时 · ${who}`, body: uiFence(title), foot: "已按扩展默认值处理，任务继续运行" }));
+                sendText(plainText({ head: "⏱️ 请求已超时，已按扩展默认值处理", subject: who, body: uiFence(title), foot: "任务继续运行" }));
             return;
         }
         const answer = uiTimeoutAnswer(kind);
         if (settleUiPrompt(e, answer))
-            sendText(plainText({ head: `⏱️ 超时未处理，已${uiAfterLabel(kind)} · ${who}`, body: uiFence(title), foot: "任务继续运行，完成后推送" }));
+            sendText(plainText({ head: `⏱️ 超时未处理，已${uiAfterLabel(kind)}`, subject: who, body: uiFence(title), foot: "任务继续运行，完成后推送" }));
     };
     e.timer = setTimeout(e.expire, wait);
     e.timer.unref?.();
@@ -1944,7 +1958,7 @@ function openUiPrompt(t, req, reply) {
     const limit = durLabel(wait);
     if (kind === "input") {
         // 终端会话：电脑前仍可填写；手机只提醒，到点取消。
-        sendText(plainText({ head: `✏️ 电脑端等待输入 · ${who}`, body: detail, foot: `手机上无法填写 · ${limit}内未在电脑上处理将${after}` }));
+        sendText(plainText({ head: "✏️ 电脑端等待输入", subject: who, body: `${detail}\n\n${limit}内未在电脑上处理将${after}`, foot: "手机上无法填写" }));
         return;
     }
     let options;
@@ -1970,7 +1984,7 @@ function openUiPrompt(t, req, reply) {
             submit_text: "回答",
             task_id: taskId("ui"),
         };
-        void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: clip(title, 80), foot: `${e.allowText ? "可直接回复文字作答，或" : "请"}到电脑上处理 · ${limit}内未答将${after}` })));
+        void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: `${clip(title, 80)}\n\n${limit}内未答将${after}`, foot: `${e.allowText ? "可直接回复文字作答，或" : "请"}到电脑上处理` })));
         return;
     }
     if (kind === "confirm") {
@@ -1983,7 +1997,7 @@ function openUiPrompt(t, req, reply) {
             e.more = list.length - (VOTE_OPT_MAX - 1);
     }
     const more = e.more ? ` · 另有 ${e.more} 项请到电脑选择` : "";
-    sendText(plainText({ head: `🔐 ${kind === "confirm" ? "需要确认" : "需要选择"} · ${who}`, body: detail, foot: `在下方卡片选择${more} · ${limit}内未选将${after}` }));
+    sendText(plainText({ head: `🔐 ${kind === "confirm" ? "需要确认" : "需要选择"}`, subject: who, body: `${detail}\n\n${limit}内未选将${after}${more}`, foot: "在下方卡片选择" }));
     const card = {
         card_type: "vote_interaction",
         title: clip(`🔐 ${title}`, 26),
@@ -1993,7 +2007,7 @@ function openUiPrompt(t, req, reply) {
         submit_text: kind === "confirm" ? "确认" : "选择",
         task_id: taskId("ui"),
     };
-    void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: clip(title, 80), foot: `请到电脑上处理 · ${limit}内未选将${after}` })));
+    void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: `${clip(title, 80)}\n\n${limit}内未选将${after}`, foot: "请到电脑上处理" })));
 }
 function closeUiPrompt(e) {
     if (e.done)
@@ -2029,7 +2043,7 @@ function takeTextAnswer(text) {
         return null;
     settleUiPrompt(e, { custom: true, value: text.trim() });
     log(`ui answered by phone text target=${e.t.key}`);
-    return plainText({ head: `✅ 已回答 · ${e.t.label()}`, body: uiFence(`${e.title}\n→ ${text.trim()}`), foot: "任务继续运行，完成后推送" });
+    return plainText({ head: "✅ 已回答", subject: e.t.label(), body: uiFence(`${e.title}\n→ ${text.trim()}`), foot: "任务继续运行，完成后推送" });
 }
 function handleUiPick(pick) {
     const e = uiPending.get(pick.reqId);
@@ -2043,12 +2057,12 @@ function handleUiPick(pick) {
             e.timer = setTimeout(e.expire, e.wait);
             e.timer.unref?.();
         }
-        return plainText({ head: `✏️ 请直接回复文字 · ${e.t.label()}`, body: uiFence(e.title), foot: "下一条非命令消息将作为答案" });
+        return plainText({ head: "✏️ 请直接回复文字", subject: e.t.label(), body: uiFence(e.title), foot: "下一条非命令消息将作为答案" });
     }
     settleUiPrompt(e, pick.answer);
     log(`ui answered by phone target=${e.t.key} ${JSON.stringify(pick.label)}`);
     const refused = pick.answer.confirmed === false || pick.answer.cancelled;
-    return plainText({ head: `${refused ? "🚫" : "✅"} 已${pick.answer.value !== undefined ? "选择" : pick.label} · ${e.t.label()}`, body: uiFence(pick.answer.value !== undefined ? `${e.title}\n→ ${pick.label}` : e.title), foot: "任务继续运行，完成后推送" });
+    return plainText({ head: `${refused ? "🚫" : "✅"} 已${pick.answer.value !== undefined ? "选择" : pick.label}`, subject: e.t.label(), body: uiFence(pick.answer.value !== undefined ? `${e.title}\n→ ${pick.label}` : e.title), foot: "任务继续运行，完成后推送" });
 }
 const NO_BIND = () => plainText({ head: "⚠️ 未选会话", body: "还没有选定要操作的会话。", foot: "发送 `活跃会话` 选择，或 `创建会话` 新建" });
 /** footer 同款信息：目录(分支)、模型·思考强度、上下文、累计花费、其他扩展的状态项。 */
@@ -2089,13 +2103,15 @@ async function statusCard() {
     if (t.busy) {
         const r = t.run;
         return plainText({
-            head: `⏳ 运行中 · ${t.label()}`,
+            head: "⏳ 任务运行中",
+            subject: t.label(),
             body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。\n\n${info}`,
             foot: [`类型：${kind}`, ...tunnel, "发送 `停止` 停止"].join(" · "),
         });
     }
     return plainText({
-        head: `🧊 空闲 · ${t.label()}`,
+        head: "🧊 空闲",
+        subject: t.label(),
         body: `等你发消息，上次活动 ${ago(t.lastActivity)}。\n\n${info}`,
         foot: [`类型：${kind}`, ...tunnel].join(" · "),
     });
@@ -2137,7 +2153,7 @@ function applyDefaultDir(d, via = "") {
         desc: "之后新建会话默认在此目录，已有会话不受影响",
         emph: { title: via || path.basename(d) || "~", desc: tilde(d) },
         emphMax: EMPH_NAME_MAX,
-        fallback: () => plainText({ head: "📁 已切换目录", body: tilde(d), foot: "发送 `创建会话` 在此目录新建 · 已有会话不受影响" }),
+        fallback: () => plainText({ head: "📁 已切换目录", subject: tilde(d), body: "之后新建会话默认在此目录，已有会话不受影响", foot: "发送 `创建会话` 在此目录新建" }),
     });
 }
 function buildDirCard(arg) {
@@ -2155,7 +2171,8 @@ function buildDirCard(arg) {
         .slice(0, VOTE_OPT_MAX);
     if (rows.length <= 1) {
         return plainText({
-            head: `📁 当前目录 · ${tilde(cur)}`,
+            head: "📁 当前目录",
+            subject: tilde(cur),
             body: "还没有配置目录别名。",
             foot: "在电脑 Pi 执行 `/remote alias` 添加 · 或发送 `目录 ~/路径`",
         });
@@ -2174,7 +2191,8 @@ function buildDirCard(arg) {
         task_id: taskId("cwd"),
     };
     return cardBlock(card, "**请选择目录**", () => plainText({
-        head: "⚠️ 卡片发送失败 · 切换目录",
+        head: "⚠️ 卡片发送失败",
+        subject: "切换目录",
         body: rows.map(([n, d]) => `${n} · ${tilde(d)}${d === cur ? " · ← 当前" : ""}`).join("\n"),
         foot: "发送 `目录 别名` 直接切换",
     }));
@@ -2226,11 +2244,10 @@ async function finishCreate(t, msg, media, ack, note = "") {
     }
     const foot = [`目录：${tilde(t.cwd)}`, `类型：${kindOf(t)}`];
     if (r?.notDelivered) {
-        if (r.error)
-            foot.push(`原因：${String(r.error).slice(0, 60)}`);
         return plainText({
-            head: "⚠️ 已创建 · 首条未送达",
-            body: "会话已经建好，但刚才那条消息没送进去，附件已保留。请重发。",
+            head: "⚠️ 首条未送达",
+            subject: t.label(),
+            body: "会话已经建好，但刚才那条消息没送进去，附件已保留。请重发。" + (r.error ? `\n\n原因：${String(r.error).slice(0, 60)}` : ""),
             foot: [...foot, note].filter(Boolean).join(" · "),
         });
     }
@@ -2257,7 +2274,7 @@ async function newBackground(cwd, msg, media, ack, note = "") {
     }
     catch (e) {
         rt.close();
-        return plainText({ head: "⚠️ 新建失败 · 后台会话", body: e.message, foot: "发送 `创建会话` 改用终端" });
+        return plainText({ head: "⚠️ 新建失败", subject: "后台会话", body: e.message, foot: "发送 `创建会话` 改用终端" });
     }
     return finishCreate(rt, msg, media, ack, note);
 }
@@ -2275,7 +2292,7 @@ async function newTerminalTab(cwd, msg, media, ack) {
         term = await resolveTerminal(CFG);
     }
     catch (e) {
-        return plainText({ head: "⚠️ 新建失败 · 标签页", body: e.message, foot: "发送 `创建后台会话` 改用后台" });
+        return plainText({ head: "⚠️ 新建失败", subject: "标签页", body: e.message, foot: "发送 `创建后台会话` 改用后台" });
     }
     if (!term) {
         log(`创建会话 未找到可用终端（terminal=${CFG.terminal}），已降级为后台会话 cwd=${tilde(cwd)}`);
@@ -2293,7 +2310,8 @@ async function newTerminalTab(cwd, msg, media, ack) {
     }
     catch (e) {
         return plainText({
-            head: `⚠️ 新建失败 · ${term.label}`,
+            head: "⚠️ 新建失败",
+            subject: term.label,
             body: e.message,
             foot: `${term.hint} · 发送 \`创建后台会话\` 改用后台`,
         });
@@ -2329,8 +2347,9 @@ async function applyPick(pick, rows) {
         row = rows.find((x) => x.sessionFile === pick.sessionFile);
     const fail = () => plainText({
         head: "⚠️ 切换失败",
-        body: pick.name || "会话",
-        foot: "会话已关闭或不在列表里 · 发送 `活跃会话` 重新选择",
+        subject: pick.name || "会话",
+        body: "会话已关闭或不在列表里",
+        foot: "发送 `活跃会话` 重新选择",
     });
     if (!row)
         return fail();
@@ -2363,7 +2382,7 @@ async function buildSelectedCard(t) {
         emph: { title: name },
         emphMax: EMPH_NAME_MAX,
         facts,
-        fallback: () => plainText({head: "📥 选择会话", body: name,
+        fallback: () => plainText({head: "📥 选择会话", subject: name,
             foot: facts.map(f => `${f.keyname}：${f.value}`).join(" · ")}),
     });
 }
@@ -2371,16 +2390,16 @@ async function buildSelectedCard(t) {
 function buildCreatedCard(t, note = "") {
     const name = t.name || t.hint || "新会话";
     const text = () => plainText({
-        head: "✏️ 创建会话",
-        body: name,
-        foot: [`目录：${tilde(t.cwd)}`, `类型：${kindOf(t)}`, `模型：${t.model || "未知"}`, note].filter(Boolean).join(" · "),
+        head: "✏️ 会话已创建",
+        subject: name,
+        foot: [`目录：${tilde(t.cwd)}`, `类型：${kindOf(t)}`, `模型：${t.model || "未知"}`, note, t.busy ? "" : "发送 `创建会话 消息` 直接完成"].filter(Boolean).join(" · "),
     });
     return stateCard({
         tag: "created",
         lead: `**✏️ 已创建 ${clip(name, 20)}**`,
         icon: "✏️",
         title: "创建会话",
-        desc: t.busy ? "任务已开始，完成后推送结果" : "已创建，可开始对话",
+        desc: t.busy ? "任务已开始，完成后推送结果" : "已创建 · 发 「创建会话 消息」直接完成",
         body: note,
         emph: { title: name },
         emphMax: EMPH_NAME_MAX,
@@ -2494,13 +2513,13 @@ async function handleCommand(text, media = [], ack = { media: false }) {
         if (!t)
             return NO_BIND();
         if (!t.busy)
-            return plainText({ head: "🧊 无需中断", body: t.label(), foot: "当前空闲，没有在跑的任务" });
+            return plainText({ head: "🧊 无需中断", subject: t.label(), body: "当前空闲，没有在跑的任务" });
         if (t.kind === "tui") {
             if (!t.run?.id)
                 return "当前轮次尚未注册，请稍后重试中断。";
             t.inbox.push({ type: "abort", runId: t.run.id });
             t.waiter?.();
-            return plainText({ head: "⏳ 已请求中断", body: t.label(), foot: "等待终端确认 · 发送 `状态` 查看" });
+            return plainText({ head: "⏳ 已请求中断", subject: t.label(), body: "等待终端确认", foot: "发送 `状态` 查看" });
         }
         const run = t.run;
         if (run)
@@ -2509,16 +2528,19 @@ async function handleCommand(text, media = [], ack = { media: false }) {
         if (!ok) {
             if (run)
                 run.stopped = run.stopByCmd = false;
-            return plainText({ head: "⚠️ 中断失败", body: t.label(), foot: "发送 `状态` 查看" });
+            return plainText({ head: "⚠️ 中断失败", subject: t.label(), foot: "发送 `状态` 查看" });
         }
         return plainText({
             head: "⚠️ 已中断",
-            body: t.label(),
-            foot: `已运行 ${run ? runFor(run) : "-"}${run?.lastText ? " · 已产出的部分稍后推送" : ""}`,
+            subject: t.label(),
+            body: run?.lastText ? "已产出的部分稍后推送" : "",
+            foot: `已运行 ${run ? runFor(run) : "-"}`,
         });
     }
     if (cmd === "status")
         return statusCard();
+    if (cmd === "restart")
+        return restartDaemon(rest);
     if (cmd === "model") {
         const t = currentTarget();
         if (!t)
@@ -2540,6 +2562,26 @@ async function handleCommand(text, media = [], ack = { media: false }) {
     if (cmd === "cd")
         return buildDirCard(rest);
     return plainText({ head: "⚠️ 未实现的命令", body: cmd, foot: "发送 `帮助` 查看命令" });
+}
+/** 企微重启：回执发出后向自身发 SIGTERM，走优雅退出，由 launchd KeepAlive 拉起。 */
+function restartDaemon(rest) {
+    const force = /^(force|强制)$/i.test(rest);
+    if (rest && !force)
+        return plainText({ head: "⚠️ 用法", body: "`重启` 或 `重启 force`（force 会中断正在运行的任务）" });
+    if (process.env.XPC_SERVICE_NAME !== "dev.pi-remote-wecom.daemon") {
+        return plainText({ head: "⚠️ 无法重启", body: "当前不是 launchd 托管运行，退出后无人拉起。", foot: "请在电脑上手动重启" });
+    }
+    const busy = [...targets.values()].filter((t) => t.busy);
+    if (busy.length && !force) {
+        return plainText({
+            head: "⚠️ 仍有任务运行",
+            body: busy.map((t) => t.label()).join("\n"),
+            foot: "等任务结束，或发送 `重启 force` 强制重启（后台会话会被中断）",
+        });
+    }
+    log(`收到重启命令 force=${force} busy=${busy.length}`);
+    setTimeout(() => process.kill(process.pid, "SIGTERM"), 1500).unref?.();
+    return plainText({ head: "🔄 正在重启", body: "约 10 秒后自动重连，连上后会收到一条确认。", foot: "终端会话会自动重连" });
 }
 const RUN_STUCK_MS = SILENCE_STEPS_MS[SILENCE_STEPS_MS.length - 1] + 30 * 60000;
 setInterval(() => {

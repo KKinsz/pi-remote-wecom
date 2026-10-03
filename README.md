@@ -60,6 +60,7 @@ On your phone, select a session and send a message to continue it.
 | `think [level]` | Switch the current session's thinking level; the list only shows levels the current model supports |
 | `compact [note]` | Manually compact the current session's context; the optional note guides the summary. Not allowed while running; auto-compaction stays with Pi |
 | `cd [alias]` | Pick the default directory for new sessions from your directory aliases (default `~`); existing sessions are unaffected |
+| `restart [force]` | Restart the remote-control daemon (loads new code); refused while a task is running unless `force` is given |
 | `status` | Show the current session's status: directory and branch, model and thinking level, context, cost, and statuses set by other extensions via `setStatus` (built-in footer layout; no footer extension required) |
 | `stop` | Interrupt the current task |
 | `help` | Show all commands |

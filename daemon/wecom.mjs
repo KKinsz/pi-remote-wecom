@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {WSClient} from '@wecom/aibot-node-sdk';
-import {WELCOME_FILE, BIND_FILE, BIND_MAX_FAILURES} from './config.mjs';
+import {WELCOME_FILE, BIND_FILE, BIND_MAX_FAILURES, RESTART_FILE, RESTART_NOTICE_TTL_MS} from './config.mjs';
 
 export const PENDING_MEDIA_TTL_MS = 5 * 60 * 1000;
 export const MARKDOWN_MAX_BYTES = 20_000;
@@ -10,6 +10,7 @@ export const MARKDOWN_MAX_BYTES = 20_000;
 // 与视频回调」，未给出精确字节定义；本项目按 100 MiB（104,857,600 字节）实现。
 // 该检查发生在完整下载并解密之后（SDK 的 downloadFile 返回整个 Buffer），因此它只能
 // 拦住超限结果继续落盘，并不能降低下载/解密期间的峰值内存。
+export const MAX_ATTACHMENTS = 10;
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MARKDOWN_ATTACHMENT_NOTICE = '正文超过企微单条消息上限，已作为 Markdown 附件发送。';
 
@@ -114,6 +115,7 @@ const writeJson = (file, value) => {
  * Durable outgoing queue is at-least-once: a lost server ACK may cause a duplicate.
  */
 export const WELCOME = 'Pi Remote 已连接，发送`帮助`查看命令。';
+export const RESTART_NOTICE = 'Pi Remote 已重启，企微已连接，发送`帮助`查看命令。';
 export const BIND_DONE = '绑定成功，Pi Remote 已连接，发送`帮助`查看命令。';
 /**
  * 绑定成功卡片（text_notice）。真机实测约束：main_title 必填；card_action 必须是有效跳转（type 0 或缺省会被拒收）。
@@ -148,9 +150,11 @@ export class WeComTransport {
       ...(config.wsUrl ? {wsUrl: config.wsUrl} : {}),
       logger: {debug() {}, info() {}, warn() {}, error() {}}});
     this.welcomeFile = path.join(dir, WELCOME_FILE);
+    this.restartFile = path.join(dir, RESTART_FILE);
     this.client.on('authenticated', () => {
       this.connected = true; this.reason = this.bound() ? '已连接' : '已连接，待绑定验证';
-      if (this.bound()) this.greetOnce();
+      if (this.bound())
+        this.greetOnce();
       void this.flush();
     });
     this.client.on('disconnected', () => {this.connected = false; this.reason = '连接断开，等待重连';});
@@ -171,9 +175,32 @@ export class WeComTransport {
   /** Proactive welcome once per bot+owner; /remote setup clears the marker so each setup greets again. */
   greetOnce() {
     const key = `${this.config.botId}\n${this.config.ownerUserId}`;
+    if (this.greetRestarted())
+      return;
     try { if (JSON.parse(fs.readFileSync(this.welcomeFile, 'utf8')).key === key) return; } catch {}
     try { writeJson(this.welcomeFile, {key}); } catch { this.log('欢迎标记写入失败'); return; }
     void this.send(WELCOME);
+  }
+  /**
+   * 进程重启后主动发一条「已连接」。SDK 每次 WebSocket 重连都会触发 authenticated，
+   * 因此只看磁盘上的一次性标记：旧进程优雅退出前写入，这里消费掉；网络抖动不会有标记。
+   * 标记过期（长时间未启动）视为无效并删除，避免隔天开机补发一条莫名其妙的提示。
+   */
+  greetRestarted() {
+    let mark = null;
+    try { mark = JSON.parse(fs.readFileSync(this.restartFile, 'utf8')); } catch { return false; }
+    try { fs.rmSync(this.restartFile, {force: true}); } catch {}
+    if (mark?.botId !== this.config.botId || Date.now() - Number(mark?.at || 0) > RESTART_NOTICE_TTL_MS)
+      return false;
+    void this.send(RESTART_NOTICE);
+    return true;
+  }
+  /** 优雅退出前调用：留一条标记，让接管的新进程连上后主动通知一次。 */
+  markRestartPending() {
+    if (!this.bound())
+      return;
+    try { writeJson(this.restartFile, {at: Date.now(), botId: this.config.botId}); }
+    catch { this.log('重启标记写入失败'); }
   }
   bound() {return Boolean(this.config.ownerUserId);}
   /** Direct chat to this bot from a real sender: the only shape that may bind or control. */
@@ -231,7 +258,7 @@ export class WeComTransport {
     this.timer = setInterval(() => void this.flush(), 5000); this.timer.unref();
   }
   /** Shutdown: refuse new inbound immediately, keep the socket only to flush replies already queued. */
-  drain() {this.draining = true;}
+  drain() {this.draining = true; this.markRestartPending();}
   stop() {this.closed = true; clearInterval(this.timer); clearTimeout(this.ackTimer); this.client.disconnect(); this.connected = false;}
   status() {return {connected: this.connected, reason: this.reason, bound: this.bound(), pending: this.queueFiles().length};}
   rememberCard(card) {
@@ -363,7 +390,7 @@ export class WeComTransport {
         : '';
       if (!text && media.length) {
         this.pendingMedia.push(...media.map(item => ({...item, at: now})));
-        this.pendingMedia = this.pendingMedia.slice(-4);
+        this.pendingMedia = this.pendingMedia.slice(-MAX_ATTACHMENTS);
         // 多附件会拆成多条入站消息：防抖合并，只回复一条，按暂存总数区分单个/多个。
         if (expiryNotice) this.ackNotice = expiryNotice;
         clearTimeout(this.ackTimer);
@@ -385,7 +412,7 @@ export class WeComTransport {
       }
       if (expiryNotice) await this.send(expiryNotice);
       const files = [...this.pendingMedia, ...media];
-      if (files.length > 4) {await this.send('一次最多处理 4 个附件，请减少附件后重试。'); return;}
+      if (files.length > MAX_ATTACHMENTS) {await this.send(`一次最多处理 ${MAX_ATTACHMENTS} 个附件，请减少附件后重试。`); return;}
       const ack = {media: false};
       const reply = await this.onMessage(text, files, ack);
       if (ack.media) this.pendingMedia = [];
@@ -395,7 +422,7 @@ export class WeComTransport {
   }
   async prepare(body) {
     const parts = messageParts(body);
-    if (parts.media.length > 4) throw new Error('too many files');
+    if (parts.media.length > MAX_ATTACHMENTS) throw new Error('too many files');
     const dir = this.config.inboxDir.replace(/^~(?=\/|$)/, process.env.HOME);
     fs.mkdirSync(dir, {recursive: true, mode: 0o700});
     const media = [];

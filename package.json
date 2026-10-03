@@ -1,6 +1,6 @@
 {
   "name": "pi-remote-wecom",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Control multiple local Pi sessions from WeCom, with session naming, attachments, and task results.",
   "type": "module",
   "license": "MIT",

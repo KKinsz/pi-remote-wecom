@@ -126,14 +126,15 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.doesNotMatch(status.reply,/调用 \d+ 次/);
   const help=await api('/command',{text:'帮助'});
   assert.match(help.reply,/^\*\*📖 命令表\*\*/);
-  assert.match(help.reply,/^\*\*Tips\*\*\n\n`1\. /m);
-  assert.match(help.reply,/`2\. .*\/tabmodel/);
+  assert.match(help.reply,/^\*\*Tips\*\*\n\n> 1\. /m);
+  assert.match(help.reply,/^> 2\. .*\/tabmodel/m);
+  assert.match(help.reply,/^> 3\. .*附件/m);
   assert.doesNotMatch(help.reply,/select/);
-  assert.match(help.reply,/历史会话 关键词/); assert.doesNotMatch(help.reply,/\.(ls|h|n|nb|status|help|stop)/);
+  assert.doesNotMatch(help.reply,/关键词|重启|后台会话/); assert.doesNotMatch(help.reply,/\.(ls|h|n|nb|status|help|stop)/);
   // Short alias words replace the long ones in the panel.
-  assert.match(help.reply,/\| model \[关键词\] \| 模型 \[关键词\] \|/);
-  assert.match(help.reply,/\| think \[强度\] \| 思考强度 \[强度\] \|/);
-  assert.match(help.reply,/\| cd \[别名\] \| 目录 \[别名\] \|/);
+  assert.match(help.reply,/\| model \| 模型 \|/);
+  assert.match(help.reply,/\| think \| 思考强度 \|/);
+  assert.match(help.reply,/\| cd \| 目录 \|/);
   assert.doesNotMatch(help.reply,/切换模型 \[关键词\]/);
   // Removed dot commands and bare numbers are ordinary conversation text.
   for (const text of ['.ls','.h','.n','.nb','.stop','.status','.help','.2','.活跃会话','。帮助','2','状态不对','help me']) {
@@ -284,7 +285,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   // A run that ends while its dialog is pending retires the card: no later "timed out, auto-allowed".
   await api('/command',{text:'创建后台会话 proj 确认后结束'});
   const endCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('结束前确认')).at(-1)?.template_card);
-  await until(()=>sent.some(x=>/已中断 · .*确认后结束/.test(x.markdown?.content||'')));
+  await until(()=>sent.some(x=>/已中断[\s\S]*### 💬 .*确认后结束/.test(x.markdown?.content||'')));
   pickUi(endCard,'允许'); await until(()=>sent.filter(x=>x.markdown?.content.includes('这个请求已经处理过')).length===1);
 
   pickUi(uiCard,'允许'); await until(()=>sent.some(x=>x.markdown?.content.includes('已经提交过')));
@@ -304,7 +305,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const selCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('选择环境')).at(-1)?.template_card);
   assert.deepEqual(selCard.checkbox.option_list.map(o=>o.text),['dev','prod','取消']);
   pickUi(selCard,'prod');
-  await until(()=>sent.some(x=>x.markdown?.content.includes('已选择 · 会话A')&&x.markdown.content.includes('→ prod')));
+  await until(()=>sent.some(x=>/已选择\*\*[\s\S]*### 💬 会话A/.test(x.markdown?.content||'')&&x.markdown.content.includes('→ prod')));
   const ans=(await api(`/poll?key=${a.key}`)).messages.find(m=>m.type==='ui_answer');
   assert.deepEqual(ans,{type:'ui_answer',reqId:'tui-ui-1',value:'prod'});
   // Answered on the computer first: the phone card becomes stale.
@@ -389,4 +390,53 @@ test('真实 SDK + daemon：未填 userid 启动，绑定码绑定后写回配�
   assert.equal(fs.existsSync(path.join(dir,'bind.json')), false);
   const cfg = JSON.parse(fs.readFileSync(path.join(dir,'config.json'),'utf8'));
   assert.equal(cfg.localPort, port); assert.equal(cfg.secret, 'test-secret');
+});
+
+test('真实 daemon：手机「重启」命令走优雅退出并在重新拉起后主动通知', {timeout: 40000}, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-wecom-restart-'));
+  const port = await freePort();
+  const server = new WebSocketServer({host:'127.0.0.1',port:0});
+  await new Promise(r=>server.on('listening',r));
+  const sockets = []; const sent = [];
+  server.on('connection', ws => {sockets.push(ws); ws.on('message', data => {
+    const frame = JSON.parse(String(data));
+    if (frame.cmd === 'aibot_send_msg') sent.push(frame.body);
+    ws.send(JSON.stringify({headers:frame.headers,errcode:0,errmsg:'ok'}));
+  });});
+  fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({botId:'test-bot',secret:'test-secret',ownerUserId:'owner',localPort:port,
+    wsUrl:`ws://127.0.0.1:${server.address().port}`,agentDir:path.join(dir,'agent'),terminal:'none',inboxDir:path.join(dir,'inbox')}));
+  fs.writeFileSync(path.join(dir,'.token'),'local-token');
+  // 重启命令要求 launchd 托管，测试里用同名环境变量模拟。
+  const spawnDaemon = () => spawn(process.execPath,['daemon/daemon.mjs'],
+    {cwd:process.cwd(),env:{...process.env,PI_REMOTE_HOME:dir,XPC_SERVICE_NAME:'dev.pi-remote-wecom.daemon'},stdio:['ignore','pipe','pipe']});
+  let child = spawnDaemon();
+  let errors = ''; child.stderr.on('data',d=>errors+=d);
+  t.after(async () => {
+    child.kill('SIGKILL');
+    for (const ws of sockets) ws.terminate(); await new Promise(r=>server.close(r));
+    fs.rmSync(dir,{recursive:true,force:true});
+  });
+  const health = async () => (await fetch(`http://127.0.0.1:${port}/health`,{headers:{'x-pi-token':'local-token'},signal:AbortSignal.timeout(2000)})).json();
+  await until(async()=>{try {return (await health()).connected;} catch {if (child.exitCode !== null) throw Error(errors); return false;}});
+  await until(()=>sent.some(b=>b.chatid==='owner'));
+  const welcomed = sent.length;
+  const socket = () => sockets[sockets.length-1];
+  const sendText = (id, text) => socket().send(JSON.stringify({cmd:'aibot_msg_callback',headers:{req_id:id},
+    body:{msgid:id,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'text',text:{content:text}}}));
+  sendText('r1','重启');
+  await until(()=>sent.some(b=>b.markdown?.content?.includes('正在重启')));
+  // 优雅退出：进程自行结束，并留下重启标记。
+  await Promise.race([new Promise(r=>child.once('exit',r)),delay(10000)]);
+  assert.notEqual(child.exitCode, null, '进程应自行退出');
+  assert.ok(fs.existsSync(path.join(dir,'restart.json')), '退出前应留下重启标记');
+  // launchd（KeepAlive）在此处的作用：重新拉起一个新进程。
+  child = spawnDaemon(); errors = ''; child.stderr.on('data',d=>errors+=d);
+  await until(async()=>{try {return (await health()).connected;} catch {if (child.exitCode !== null) throw Error(errors); return false;}});
+  await until(()=>sent.some(b=>b.markdown?.content?.includes('已重启')), 10000);
+  assert.equal(fs.existsSync(path.join(dir,'restart.json')), false, '标记应被消费');
+  // 一次性：后续重连不再重复通知。
+  const afterNotice = sent.filter(b=>b.markdown?.content?.includes('已重启')).length;
+  sendText('r2','帮助');
+  await until(()=>sent.some(b=>b.markdown?.content?.includes('命令表')));
+  assert.equal(sent.filter(b=>b.markdown?.content?.includes('已重启')).length, afterNotice);
 });
