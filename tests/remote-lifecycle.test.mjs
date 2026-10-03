@@ -19,16 +19,34 @@ test('TUI 扩展只中断指定轮次；重载取消旧轮询，不向新会话�
     });
     return Response.json({ok:true});
   };
-  const hooks=new Map();let aborts=0; let idle=false;
+  const hooks=new Map();let aborts=0; let idle=false;let thinking='high'; const thinkingSet=[];
   const extension=(await import('../extensions/remote.ts')).default;
-  const ctx={mode:'tui',cwd:dir,model:{id:'test',contextWindow:1000000},getContextUsage:()=>({tokens:98000,percent:9.8,contextWindow:1000000}),isIdle:()=>idle,abort:()=>aborts++,
-    ui:{setStatus(){},notify(){}},sessionManager:{getSessionFile:()=>'',getSessionId:()=>'session-A'}};
-  extension({on:(name,fn)=>hooks.set(name,fn),getSessionName:()=>'会话A',sendUserMessage:text=>messages.push(text)});
+  const painted=new Map();
+  const entries=[{type:'message',message:{role:'assistant',usage:{input:10,output:5,cacheRead:0,cacheWrite:0,cost:{total:0.02}}}},{type:'compaction',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0.01}}}];
+  const ctx={mode:'tui',cwd:dir,model:{id:'test',contextWindow:1000000,reasoning:true},getContextUsage:()=>({tokens:98000,percent:9.8,contextWindow:1000000}),isIdle:()=>idle,abort:()=>aborts++,
+    ui:{setStatus(k,v){painted.set(k,v);},notify(){}},sessionManager:{getSessionFile:()=>'',getSessionId:()=>'session-A',getEntries:()=>entries}};
+  extension({on:(name,fn)=>hooks.set(name,fn),getSessionName:()=>'会话A',getThinkingLevel:()=>thinking,setThinkingLevel:l=>{thinkingSet.push(l);thinking=l;},sendUserMessage:text=>messages.push(text)});
   t.after(async()=>{await hooks.get('session_shutdown')?.();globalThis.fetch=originalFetch;if(previous===undefined)delete process.env.PI_REMOTE_HOME;else process.env.PI_REMOTE_HOME=previous;fs.rmSync(dir,{recursive:true,force:true});});
   await hooks.get('session_start')({},ctx);await until(()=>polls.length===1);
   assert.equal(calls.find(x=>x.endpoint==='/register').body.contextWindow,1000000);
   assert.equal('autoName' in calls.find(x=>x.endpoint==='/register').body,false); // 未传 autoName 时不上报，daemon 保持等待
   assert.equal(calls.find(x=>x.endpoint==='/register').body.ctxPercent,9.8);
+  // Footer info: other extensions' statuses are captured (ANSI/icon stripped), own status excluded, cleared on undefined.
+  ctx.ui.setStatus('quota','\u001b[32m\uf0e7 额度 72%\u001b[0m'); ctx.ui.setStatus('idle','空闲 3m'); ctx.ui.setStatus('idle',undefined);
+  assert.equal(painted.get('quota'),'\u001b[32m\uf0e7 额度 72%\u001b[0m'); // terminal rendering untouched
+  polls[0].reply([{type:'get_meta',reqId:'f1'}]);await until(()=>calls.some(x=>x.endpoint==='/meta-ack'));
+  const metaAck=calls.find(x=>x.endpoint==='/meta-ack').body;
+  assert.deepEqual(metaAck.statuses,['额度 72%']); assert.equal(metaAck.thinkingLevel,'high');
+  assert.deepEqual(metaAck.thinkingLevels,['off','minimal','low','medium','high']);
+  assert.equal(Number(metaAck.usage.cost.toFixed(2)),0.03); assert.equal(metaAck.reqId,'f1');
+  await until(()=>polls.length===2); polls.shift();
+  // Thinking level from the phone: unsupported levels are refused, supported ones go through pi.setThinkingLevel.
+  polls[0].reply([{type:'set_thinking',reqId:'s1',level:'max'},{type:'set_thinking',reqId:'s2',level:'low'}]);
+  await until(()=>calls.filter(x=>x.endpoint==='/meta-ack').length===3);
+  const [bad,good]=calls.filter(x=>x.endpoint==='/meta-ack').slice(1).map(x=>x.body);
+  assert.equal(bad.ok,false); assert.match(bad.error,/不支持/);
+  assert.equal(good.ok,true); assert.equal(good.thinkingLevel,'low'); assert.deepEqual(thinkingSet,['low']);
+  await until(()=>polls.length===2); polls.shift();
   await hooks.get('before_agent_start')({prompt:'任务'});
   const runId=calls.find(x=>x.endpoint==='/turn').body.runId;
   polls[0].reply([{type:'abort',runId:'old-run'}]);await until(()=>polls.length===2);assert.equal(aborts,0);

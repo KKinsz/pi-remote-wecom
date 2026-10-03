@@ -232,7 +232,7 @@ export class WeComTransport {
   }
   /** Shutdown: refuse new inbound immediately, keep the socket only to flush replies already queued. */
   drain() {this.draining = true;}
-  stop() {this.closed = true; clearInterval(this.timer); this.client.disconnect(); this.connected = false;}
+  stop() {this.closed = true; clearInterval(this.timer); clearTimeout(this.ackTimer); this.client.disconnect(); this.connected = false;}
   status() {return {connected: this.connected, reason: this.reason, bound: this.bound(), pending: this.queueFiles().length};}
   rememberCard(card) {
     if (!card?.task_id || card.card_type !== 'vote_interaction') return;
@@ -364,8 +364,22 @@ export class WeComTransport {
       if (!text && media.length) {
         this.pendingMedia.push(...media.map(item => ({...item, at: now})));
         this.pendingMedia = this.pendingMedia.slice(-4);
-        await this.send([expiryNotice, '附件已收到，在 5 分钟内补充说明文字；随后将和附件一并发送。'].filter(Boolean).join('\n')); return;
+        // 多附件会拆成多条入站消息：防抖合并，只回复一条，按暂存总数区分单个/多个。
+        if (expiryNotice) this.ackNotice = expiryNotice;
+        clearTimeout(this.ackTimer);
+        this.ackTimer = setTimeout(() => {
+          const n = this.pendingMedia.length, notice = this.ackNotice; this.ackNotice = '';
+          if (!n) return;
+          const tip = n === 1
+            ? '附件已收到，请在 5 分钟内补充说明文字；随后将和该附件一并发送。'
+            : `${n} 个附件已收到，请在 5 分钟内补充说明文字；随后将和这 ${n} 个附件一并发送。`;
+          void this.send([notice, tip].filter(Boolean).join('\n')).catch(() => this.log('附件确认发送失败'));
+        }, 1500);
+        this.ackTimer.unref?.();
+        return;
       }
+      clearTimeout(this.ackTimer);
+      if (this.ackNotice) {await this.send(this.ackNotice); this.ackNotice = '';}
       if (!text) {
         await this.send([expiryNotice, '暂不支持这类消息，请发送文字、图片、文件或语音。'].filter(Boolean).join('\n')); return;
       }

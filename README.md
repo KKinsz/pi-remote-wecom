@@ -57,7 +57,10 @@ On your phone, select a session and send a message to continue it.
 | `n [directory] [message]` | Create a terminal session |
 | `nb [directory] [message]` | Create a background RPC session |
 | `model [keywords]` | Switch the current session's model; the list follows your scope (enabledModels), keywords search all authenticated models |
-| `status` | Show the current session's status |
+| `think [level]` | Switch the current session's thinking level; the list only shows levels the current model supports |
+| `compact [note]` | Manually compact the current session's context; the optional note guides the summary. Not allowed while running; auto-compaction stays with Pi |
+| `cd [alias]` | Pick the default directory for new sessions from your directory aliases (default `~`); existing sessions are unaffected |
+| `status` | Show the current session's status: directory and branch, model and thinking level, context, cost, and statuses set by other extensions via `setStatus` (built-in footer layout; no footer extension required) |
 | `stop` | Interrupt the current task |
 | `help` | Show all commands |
 

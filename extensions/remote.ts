@@ -18,6 +18,7 @@ type QOption = {label: string; description?: string; value?: string};
 type Question = {id: string; label: string; prompt: string; options: QOption[]; allowOther: boolean};
 type DialogKind = 'confirm' | 'select' | 'input' | 'editor';
 const UI_PATCHED = Symbol.for('pi-remote-wecom.ui');
+const STATUS_PATCHED = Symbol.for('pi-remote-wecom.status');
 const isOptions = (x: unknown): x is QOption[] => Array.isArray(x) && x.every(o => o && typeof o.label === 'string');
 /** 按参数形状识别提问工具，不绑定工具名：question {question, options} / questionnaire {questions[]}。 */
 function askingKind(args: any): Asking['kind'] | null {
@@ -30,6 +31,42 @@ function askingKind(args: any): Asking['kind'] | null {
 function normalizeQuestions(a: Asking): Question[] {
   if (a.kind === 'question') return [{id: 'q', label: 'Q1', prompt: a.args.question, options: a.args.options, allowOther: true}];
   return a.args.questions.map((q: any, i: number) => ({...q, label: q.label || `Q${i + 1}`, allowOther: q.allowOther !== false}));
+}
+/** 其他扩展 setStatus 的文本带 ANSI 颜色与 Nerd Font 图标：手机上只留可读文字。 */
+export function plainStatus(text: string) {
+  return String(text)
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, '')
+    .replace(/[\u0000-\u001f\u007f\uE000-\uF8FF]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+/** 与内置 footer 相同的累计口径：助手消息、工具上报、压缩/分支摘要。 */
+function usageTotals(ctx: ExtensionContext) {
+  const u = {input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0};
+  const add = (x: any) => {
+    if (!x) return;
+    u.input += x.input || 0; u.output += x.output || 0;
+    u.cacheRead += x.cacheRead || 0; u.cacheWrite += x.cacheWrite || 0;
+    u.cost += x.cost?.total || 0;
+  };
+  try {
+    for (const e of ctx.sessionManager.getEntries() as any[]) {
+      if (e.type === 'usage') add(e.usage);
+      else if (e.type === 'message' && (e.message?.role === 'assistant' || e.message?.role === 'toolResult')) add(e.message.usage);
+      else if (e.type === 'branch_summary' || e.type === 'compaction') add(e.usage);
+    }
+  } catch {}
+  return u;
+}
+// 与 pi-ai getSupportedThinkingLevels 同规则；不直接 import，避免旧版 Pi 缺该导出时整个扩展加载失败。
+const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+export function thinkingLevels(model: any): string[] {
+  if (!model?.reasoning) return [];
+  return THINKING_LEVELS.filter(level => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    return level === 'xhigh' || level === 'max' ? mapped !== undefined : true;
+  });
 }
 function meta(ctx: ExtensionContext) {
   const usage = ctx.getContextUsage();
@@ -65,6 +102,15 @@ function renderStatus(label: string, tone: Tone) {
 }
 export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean} = {}) {
   let active: Runtime | undefined;
+  // 其他扩展写进 footer 的状态项（每人不同）：从 ui.setStatus 截获，状态卡片按需上报。
+  const extStatuses = new Map<string, string>();
+  function footerInfo(r: Runtime) {
+    let thinkingLevel = '';
+    try {thinkingLevel = r.ctx.model?.reasoning ? String(pi.getThinkingLevel()) : '';} catch {}
+    const statuses = [...extStatuses].filter(([k, v]) => k !== r.statusKey && v)
+      .sort(([a], [b]) => a.localeCompare(b)).map(([, v]) => v).slice(0, 8);
+    return {thinkingLevel, thinkingLevels: thinkingLevels(r.ctx.model), usage: usageTotals(r.ctx), statuses};
+  }
   /**
    * 手机发起的轮次里，扩展弹窗同时转到手机：终端照常显示，谁先回答用谁的，另一边关闭。
    * Pi 没有官方的"外部回答弹窗"接口，这里替换共享的 ctx.ui 方法；替换失败或不在手机轮次时原样透传。
@@ -162,7 +208,21 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     for (const resolve of r.uiWaits.values()) resolve({lost: true});
     r.uiWaits.clear(); r.uiReqs.clear();
   }
+  /** 截获其他扩展写进 footer 的状态项；终端显示原样不变。与弹窗补丁分开，任一失败不影响另一个。 */
+  function patchStatus(ui: any) {
+    if (!ui || ui[STATUS_PATCHED] || typeof ui.setStatus !== 'function') return;
+    try {
+      const setStatus = ui.setStatus;
+      ui.setStatus = (key: string, text: string | undefined) => {
+        const clean = typeof text === 'string' ? plainStatus(text) : '';
+        if (clean) extStatuses.set(String(key), clean.slice(0, 80)); else extStatuses.delete(String(key));
+        return setStatus.call(ui, key, text);
+      };
+      Object.defineProperty(ui, STATUS_PATCHED, {value: true});
+    } catch {}
+  }
   function patchUi(ui: any) {
+    patchStatus(ui);
     if (!ui || ui[UI_PATCHED] || typeof ui.confirm !== 'function' || typeof ui.select !== 'function') return;
     try {
       const orig = {confirm: ui.confirm, select: ui.select, input: ui.input, editor: ui.editor};
@@ -233,6 +293,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
       token: '', port: cfg.localPort, statusKey: cfg.statusKey, runId: null, text: '',
       toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: []};
     active = r;
+    extStatuses.clear(); // 新会话/重载时 Pi 已清空 footer 状态
     patchUi(ctx.ui);
     configureStatus(cfg);
     // Placeholder after the session_start chain so the entry sorts last in the footer.
@@ -276,6 +337,35 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
           if (msg.type === 'ui_answer') {
             const resolve = r.uiWaits.get(String(msg.reqId));
             if (resolve) {r.uiWaits.delete(String(msg.reqId)); resolve(msg);}
+            continue;
+          }
+          if (msg.type === 'get_meta') {
+            await call(r, '/meta-ack', {key: r.key, reqId: msg.reqId, ...meta(r.ctx), ...footerInfo(r)});
+            continue;
+          }
+          if (msg.type === 'set_thinking') {
+            let ok = false; let error = '';
+            try {
+              if (!thinkingLevels(r.ctx.model).includes(String(msg.level))) error = '当前模型不支持该思考强度';
+              else {pi.setThinkingLevel(String(msg.level) as any); ok = true;}
+            } catch (e) {error = String((e as Error)?.message || e).slice(0, 120);}
+            const info = footerInfo(r);
+            await call(r, '/meta-ack', {key: r.key, reqId: msg.reqId, ok, error, ...meta(r.ctx), ...info});
+            if (ok) ctx.ui.notify(`手机已切换思考强度：${info.thinkingLevel}`, 'info');
+            continue;
+          }
+          if (msg.type === 'compact') {
+            // 压缩耗时可达数十秒，不阻塞轮询（否则期间收不到停止等消息）：后台完成后再 ack。
+            const reqId = msg.reqId; const rt = r;
+            const done = (extra: Json) => {void call(rt, '/meta-ack', {key: rt.key, reqId, ...extra});};
+            try {
+              ctx.ui.notify('手机发起压缩会话', 'info');
+              ctx.compact({
+                customInstructions: typeof msg.instructions === 'string' && msg.instructions ? msg.instructions : undefined,
+                onComplete: (res: any) => done({ok: true, tokensBefore: res?.tokensBefore, tokensAfter: res?.estimatedTokensAfter}),
+                onError: (e: Error) => done({ok: false, error: String(e?.message || e).slice(0, 120)}),
+              });
+            } catch (e) {done({ok: false, error: String((e as Error)?.message || e).slice(0, 120)});}
             continue;
           }
           if (msg.type === 'set_model') {

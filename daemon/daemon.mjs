@@ -40,6 +40,8 @@ const EMPH_DESC_MAX = 15;
 const EMPH_NAME_MAX = 16;
 const POLL_HOLD_MS = 25000;
 const MODEL_ACK_MS = 10000;
+const COMPACT_MS = 5 * 60000;
+const META_ACK_MS = 3000;
 const MODEL_LIST_MAX = 60;
 const MODEL_ALL_MAX = 500;
 // 手机发起的任务里，扩展弹窗转企微卡片；confirm 超时策略见 remoteConfirm。
@@ -93,6 +95,39 @@ function resolveCwd(alias) {
         return HOME;
     const mapped = dirAliases()[alias.toLowerCase()];
     return expandPath(mapped || alias);
+}
+/** 扩展 setStatus 文本带 ANSI 颜色与 Nerd Font 图标：手机上只留可读文字。 */
+function plainStatus(text) {
+    return String(text)
+        .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+        .replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, "")
+        .replace(/[\u0000-\u001f\u007f\uE000-\uF8FF]/g, " ")
+        .replace(/\s+/g, " ").trim();
+}
+/** 与 Pi footer 相同：向上找 .git（目录或 worktree 文件），读 HEAD 得分支名。 */
+function gitBranch(cwd) {
+    try {
+        for (let dir = path.resolve(cwd);; dir = path.dirname(dir)) {
+            const dotGit = path.join(dir, ".git");
+            if (fs.existsSync(dotGit)) {
+                let gitDir = dotGit;
+                if (fs.statSync(dotGit).isFile()) {
+                    const m = fs.readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m);
+                    if (!m)
+                        return "";
+                    gitDir = path.resolve(dir, m[1].trim());
+                }
+                const head = fs.readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
+                const ref = head.match(/^ref:\s*refs\/heads\/(.+)$/);
+                return ref ? ref[1] : "detached";
+            }
+            if (path.dirname(dir) === dir)
+                return "";
+        }
+    }
+    catch {
+        return "";
+    }
 }
 function tilde(p) {
     return p === HOME ? "~" : p.startsWith(HOME + "/") ? "~" + p.slice(HOME.length) : p;
@@ -359,6 +394,10 @@ class Target {
         this.loops = new Map();
         this.closed = false;
         this.mtimeMs = Date.now();
+        // footer 信息：扩展状态（终端由扩展上报、后台从 RPC setStatus 收集）、思考强度、累计花费。
+        this.statuses = new Map();
+        this.thinkingLevel = "";
+        this.cost = null;
     }
     get busy() {
         if (this.run && !this.run.settled)
@@ -533,6 +572,14 @@ class RpcTarget extends Target {
                 this.failStart(`扩展在启动时请求${rec.method === "confirm" ? "确认" : "输入"}（${clip(stripCtrl(String(rec.title || "")), 40)}），后台会话无法处理，请改用终端会话`);
                 return;
             }
+            if (rec.method === "setStatus" && rec.statusKey) {
+                const text = typeof rec.statusText === "string" ? plainStatus(rec.statusText) : "";
+                if (text)
+                    this.statuses.set(String(rec.statusKey), text.slice(0, 80));
+                else
+                    this.statuses.delete(String(rec.statusKey));
+                return;
+            }
             // 后台会话只由手机驱动：所有阻塞弹窗都转到手机（其余 fire-and-forget 忽略）。
             if (UI_KINDS.has(rec.method) && typeof rec.id === "string") {
                 openUiPrompt(this, { reqId: rec.id, kind: rec.method, title: rec.title, message: rec.message, options: rec.options, limitMs: rec.timeout }, (answer) => this.uiRespond(rec.id, answer));
@@ -689,10 +736,18 @@ class RpcTarget extends Target {
                 this.modelProvider = String(m.provider);
             if (m?.contextWindow > 0)
                 this.contextWindow = m.contextWindow;
+            this.thinkingLevel = m?.reasoning && r.data?.thinkingLevel ? String(r.data.thinkingLevel) : "";
         }
         catch (e) {
             log(`rpc[${this.key}] get_state 失败（模型名省略）：${e?.message || e}`);
         }
+    }
+    async footer() {
+        await this.refreshMeta();
+        const s = await this.stats();
+        if (s && typeof s.cost === "number")
+            this.cost = s.cost;
+        return s;
     }
     // { models: 默认卡片（scope 优先）, all: 关键词检索范围（全部已认证模型）, scoped: 是否命中 scope }
     async listModels() {
@@ -709,6 +764,24 @@ class RpcTarget extends Target {
         if (d.contextWindow > 0)
             this.contextWindow = d.contextWindow;
         return { ok: true };
+    }
+    /** 当前模型可选的思考强度；模型不支持推理时为空。 */
+    async thinkingLevels() {
+        await this.refreshMeta();
+        if (!this.thinkingLevel)
+            return { levels: [], current: "" };
+        const r = await this.cmd("get_available_thinking_levels", {}, 15000);
+        return { levels: (r.data?.levels || []).map(String), current: this.thinkingLevel };
+    }
+    async setThinking(level) {
+        await this.cmd("set_thinking_level", { level }, 15000);
+        await this.refreshMeta();
+        return { ok: true, level: this.thinkingLevel || level };
+    }
+    async compact(instructions) {
+        const r = await this.cmd("compact", instructions ? { customInstructions: instructions } : {}, COMPACT_MS);
+        const d = r.data || {};
+        return { ok: true, before: Number(d.tokensBefore) || 0, after: Number(d.estimatedTokensAfter) || 0 };
     }
     async abort() {
         try {
@@ -763,6 +836,45 @@ class TuiTarget extends Target {
         // 旧版扩展只上报 models：检索范围退回同一列表。
         const all = this.allModels.length ? this.allModels : this.models;
         return { models: this.models.length ? this.models : all, all, scoped: this.modelScoped };
+    }
+    /** 经轮询向扩展发请求，扩展用 /meta-ack 回复；失联或超时返回 null。 */
+    ask(msg, ms = META_ACK_MS) {
+        if (!this.alive)
+            return Promise.resolve(null);
+        const reqId = `f${Date.now().toString(36)}${crypto.randomUUID().slice(0, 8)}`;
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => { metaAcks.delete(reqId); resolve(null); }, ms);
+            metaAcks.set(reqId, { key: this.key, resolve: (v) => { clearTimeout(timer); resolve(v); } });
+            this.inbox.push({ ...msg, reqId });
+            this.waiter?.();
+        });
+    }
+    /** 让扩展现取 footer 信息；终端未响应时沿用上次上报。 */
+    footer() {
+        return this.ask({ type: "get_meta" });
+    }
+    async thinkingLevels() {
+        const s = await this.footer();
+        if (!s)
+            throw new Error("终端未响应，请稍后重试");
+        if (!Array.isArray(s.thinkingLevels))
+            throw new Error("终端扩展版本过旧，请在电脑上 /reload");
+        this.thinkingLevel = typeof s.thinkingLevel === "string" ? s.thinkingLevel : "";
+        return { levels: s.thinkingLevels.map(String), current: this.thinkingLevel };
+    }
+    async setThinking(level) {
+        const r = await this.ask({ type: "set_thinking", level }, MODEL_ACK_MS);
+        if (!r)
+            return { ok: false, error: "终端未响应，请在电脑上 /reload 后重试" };
+        if (r.ok && typeof r.thinkingLevel === "string")
+            this.thinkingLevel = r.thinkingLevel;
+        return { ok: !!r.ok, level: this.thinkingLevel || level, error: r.error ? String(r.error).slice(0, 120) : "" };
+    }
+    async compact(instructions) {
+        const r = await this.ask({ type: "compact", instructions }, COMPACT_MS);
+        if (!r)
+            return { ok: false, error: "终端未响应，请在电脑上 /reload 后重试" };
+        return { ok: !!r.ok, before: Number(r.tokensBefore) || 0, after: Number(r.tokensAfter) || 0, error: r.error ? String(r.error).slice(0, 120) : "" };
     }
     setModel(m) {
         if (!this.alive)
@@ -1373,6 +1485,11 @@ function watchAsync(t, run) {
     }, 30000);
     run.wait().then(async () => {
         clearInterval(prog);
+        // 后台会话被「停止」且没有任何文本产出：「停止」的即时回复已说明，不再推一条「（无文本输出）」。
+        if (run.stopByCmd && !run.error && !run.lastText) {
+            log(`async stopped-empty target=${t.key} dur=${human((run.endedAt || Date.now()) - run.startedAt)}（不推送）`);
+            return;
+        }
         const msg = run.aborted
             ? fmtAborted(t, run)
             : run.error
@@ -1385,7 +1502,7 @@ function watchAsync(t, run) {
         await trackedPush(msg);
     });
 }
-const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model"]);
+const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact"]);
 const NL_ALIASES = [
     ["帮助", "help", false],
     ["活跃会话", "ls", false],
@@ -1396,11 +1513,19 @@ const NL_ALIASES = [
     ["创建会话", "n", true],
     ["新建会话", "n", true],
     ["创建后台会话", "nb", true],
+    ["新建后台会话", "nb", true],
     ["状态", "status", false],
     ["查询状态", "status", false],
     ["停止", "stop", false],
     ["停止任务", "stop", false],
     ["切换模型", "model", true],
+    ["模型", "model", true],
+    ["切换目录", "cd", true],
+    ["目录", "cd", true],
+    ["切换思考强度", "think", true],
+    ["思考强度", "think", true],
+    ["压缩会话", "compact", true],
+    ["压缩", "compact", true],
 ].sort((a, b) => b[0].length - a[0].length);
 function parseNlAlias(body) {
     for (const [word, cmd, args] of NL_ALIASES) {
@@ -1425,7 +1550,7 @@ function parseCmd(text) {
         return nl;
     return parseBare(t);
 }
-const BARE_ARGS = new Set(["h", "n", "nb", "model"]);
+const BARE_ARGS = new Set(["h", "n", "nb", "model", "cd", "think", "compact"]);
 function parseBare(t) {
     const m = t.match(/^([A-Za-z]+)(?:\s+([\s\S]*))?$/);
     if (!m)
@@ -1450,7 +1575,10 @@ const helpText = () => [
     "| h 关键词 | 历史会话 关键词 |",
     "| n [目录] [消息] | 创建会话 [目录] [消息] |",
     "| nb [目录] [消息] | 创建后台会话 [目录] [消息] |",
-    "| model [关键词] | 切换模型 [关键词] |",
+    "| model [关键词] | 模型 [关键词] |",
+    "| think [强度] | 思考强度 [强度] |",
+    "| cd [别名] | 目录 [别名] |",
+    "| compact [说明] | 压缩 [说明] |",
     "| status | 状态 |",
     "| stop | 停止 |",
     "| help | 帮助 |",
@@ -1500,6 +1628,7 @@ function kilo(n) {
 }
 // ---- 模型切换 ----
 const modelAcks = new Map();
+const metaAcks = new Map();
 function modelInfo(m) {
     if (!m || typeof m !== "object" || !m.id || !m.provider)
         return null;
@@ -1573,7 +1702,7 @@ async function buildModelCard(t, find = "") {
         return plainText({
             head: `🔍 没有匹配的模型 · “${clip(find, 16)}”`,
             body: `共 ${all.length} 个已认证模型，没有找到包含该关键词的模型。`,
-            foot: "发送 `切换模型` 查看全部",
+            foot: "发送 `模型` 查看全部",
         });
     }
     if (find && hits.length === 1)
@@ -1587,7 +1716,7 @@ async function buildModelCard(t, find = "") {
     const card = {
         card_type: "vote_interaction",
         title: clip(`💡 切换模型 · ${t.label()}`, 26),
-        desc: find ? `找到 ${hits.length} 个${more}` : `可选 ${hits.length} 个${more} · 发「切换模型 关键词」筛选${scoped ? "所有模型" : ""}`,
+        desc: find ? `找到 ${hits.length} 个${more}` : `可选 ${hits.length} 个${more} · 发「模型 关键词」筛选${scoped ? "所有模型" : ""}`,
         options,
         mode: 0,
         submit_text: "切换模型",
@@ -1596,11 +1725,11 @@ async function buildModelCard(t, find = "") {
     return cardBlock(card, "**请选择模型**", () => plainText({
         head: `⚠️ 卡片发送失败 · 切换模型`,
         body: shown.map((m) => `${modelLabel(m)} · ${m.provider}${isCurrentModel(t, m) ? " · ← 当前" : ""}`).join("\n"),
-        foot: "发送 `切换模型 模型名` 直接切换",
+        foot: "发送 `模型 模型名` 直接切换",
     }));
 }
 async function applyModel(t, m) {
-    const fail = (why) => plainText({ head: "⚠️ 切换模型失败", body: `${modelLabel(m)} · ${t.label()}`, foot: `原因：${String(why || "未知").slice(0, 80)} · 发送 \`切换模型\` 重试` });
+    const fail = (why) => plainText({ head: "⚠️ 切换模型失败", body: `${modelLabel(m)} · ${t.label()}`, foot: `原因：${String(why || "未知").slice(0, 80)} · 发送 \`模型\` 重试` });
     let r;
     try {
         r = await t.setModel(m);
@@ -1631,15 +1760,128 @@ function buildModelCardDone(t, m) {
         fallback: () => plainText({ head: "💡 切换模型", body: name, foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
     });
 }
-async function handleModelPick(pick) {
+/** 卡片点选时找回会话：key 失效（重注册）则按 sessionId 找。 */
+function pickTarget(pick) {
     let t = targets.get(pick.targetKey);
     if (!t || t.closed)
         t = [...targets.values()].find((x) => x.sessionId && x.sessionId === pick.sessionId && x.kind !== "history" && !x.closed);
-    if (!t || (t.kind === "tui" && !t.alive))
+    return !t || (t.kind === "tui" && !t.alive) ? null : t;
+}
+async function handleModelPick(pick) {
+    const t = pickTarget(pick);
+    if (!t)
         return plainText({ head: "⚠️ 切换模型失败", body: "会话已关闭", foot: "发送 `活跃会话` 重新选择会话" });
     const { all: models = [] } = await t.listModels().catch(() => ({}));
     const m = models.find((x) => x.provider === pick.provider && x.id === pick.modelId) || { provider: pick.provider, id: pick.modelId };
     return applyModel(t, m);
+}
+// ---- 思考强度 ----
+const THINK_CN = { off: "关闭", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "超高", max: "最高" };
+const thinkLabel = (l) => (THINK_CN[l] ? `${l} · ${THINK_CN[l]}` : l);
+/** 接受英文级别或中文说法（高 / 关闭…）。 */
+function thinkArg(arg) {
+    const a = arg.trim().toLowerCase();
+    return Object.hasOwn(THINK_CN, a) ? a : Object.keys(THINK_CN).find((k) => THINK_CN[k] === arg.trim()) || "";
+}
+async function buildThinkCard(t, arg = "") {
+    let levels, current;
+    try {
+        ({ levels, current } = await t.thinkingLevels());
+    }
+    catch (e) {
+        return plainText({ head: "⚠️ 读取思考强度失败", body: String(e?.message || e).slice(0, 120), foot: "稍后重试，或发送 `状态` 查看" });
+    }
+    if (!levels?.length) {
+        return plainText({ head: "🧠 当前模型不支持思考强度", body: `${t.model || "未知模型"} · ${t.label()}`, foot: "发送 `模型` 换一个支持推理的模型" });
+    }
+    if (arg) {
+        const want = thinkArg(arg);
+        if (!want || !levels.includes(want))
+            return plainText({ head: "⚠️ 切换思考强度失败", body: `当前模型不支持：${clip(arg, 20)}`, foot: `可选：${levels.join(" / ")}` });
+        return applyThinking(t, want);
+    }
+    const options = levels.slice(0, VOTE_OPT_MAX).map((l) => ({
+        id: registerPick({ act: "think", targetKey: t.key, sessionId: t.sessionId, level: l }),
+        text: [thinkLabel(l), l === current ? "← 当前" : ""].filter(Boolean).join(" · "),
+    }));
+    const card = {
+        card_type: "vote_interaction",
+        title: clip(`🧠 切换思考强度 · ${t.label()}`, 26),
+        desc: clip(`模型 ${t.model || "未知"} · 当前 ${current || "未知"}`, 30),
+        options,
+        mode: 0,
+        submit_text: "切换思考强度",
+        task_id: taskId("think"),
+    };
+    return cardBlock(card, "**请选择思考强度**", () => plainText({
+        head: "⚠️ 卡片发送失败 · 切换思考强度",
+        body: levels.map((l) => `${thinkLabel(l)}${l === current ? " · ← 当前" : ""}`).join("\n"),
+        foot: "发送 `思考强度 high` 直接切换",
+    }));
+}
+const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : String(n));
+async function compactCard(t, instructions) {
+    const fail = (why) => plainText({ head: "⚠️ 压缩会话失败", body: t.label(), foot: `原因：${String(why || "未知").slice(0, 80)}` });
+    if (t.busy)
+        return fail("会话正在运行，请等任务结束或先 `停止`");
+    let r;
+    try {
+        r = await t.compact(instructions);
+    }
+    catch (e) {
+        return fail(e?.message || e);
+    }
+    if (!r?.ok)
+        return fail(r?.error);
+    log(`压缩会话 target=${t.key} ${r.before}→${r.after}`);
+    const facts = [{ keyname: "会话", value: t.label() }];
+    if (instructions)
+        facts.push({ keyname: "重点", value: instructions.slice(0, 40) });
+    const change = r.before && r.after ? `${fmtTok(r.before)} → ${fmtTok(r.after)}` : "已压缩";
+    return stateCard({
+        tag: "compact",
+        icon: "🗜️",
+        title: "压缩会话",
+        desc: "已压缩，下一条消息生效",
+        emph: { title: change },
+        emphMax: EMPH_NAME_MAX,
+        facts,
+        fallback: () => plainText({ head: "🗜️ 压缩会话", body: change, foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
+    });
+}
+async function applyThinking(t, level) {
+    const fail = (why) => plainText({ head: "⚠️ 切换思考强度失败", body: `${level} · ${t.label()}`, foot: `原因：${String(why || "未知").slice(0, 80)} · 发送 \`思考强度\` 重试` });
+    let r;
+    try {
+        r = await t.setThinking(level);
+    }
+    catch (e) {
+        return fail(e?.message || e);
+    }
+    if (!r?.ok)
+        return fail(r?.error);
+    const got = r.level || level;
+    log(`切换思考强度 target=${t.key} → ${got}${got !== level ? `（请求 ${level}）` : ""}`);
+    const facts = [
+        { keyname: "会话", value: t.label() },
+        { keyname: "模型", value: t.model || "未知" },
+    ];
+    return stateCard({
+        tag: "think",
+        icon: "🧠",
+        title: "切换思考强度",
+        desc: got !== level ? `模型不支持 ${level}，已调整为 ${got}` : t.busy ? "已切换，当前任务的后续请求生效" : "已切换，下一条消息生效",
+        emph: { title: thinkLabel(got) },
+        emphMax: EMPH_NAME_MAX,
+        facts,
+        fallback: () => plainText({ head: "🧠 切换思考强度", body: thinkLabel(got), foot: facts.map((f) => `${f.keyname}：${f.value}`).join(" · ") }),
+    });
+}
+function handleThinkPick(pick) {
+    const t = pickTarget(pick);
+    if (!t)
+        return plainText({ head: "⚠️ 切换思考强度失败", body: "会话已关闭", foot: "发送 `活跃会话` 重新选择会话" });
+    return applyThinking(t, pick.level);
 }
 // ---- 扩展弹窗转手机 ----
 const UI_KINDS = new Set(["confirm", "select", "input", "editor", "question"]);
@@ -1809,38 +2051,145 @@ function handleUiPick(pick) {
     return plainText({ head: `${refused ? "🚫" : "✅"} 已${pick.answer.value !== undefined ? "选择" : pick.label} · ${e.t.label()}`, body: uiFence(pick.answer.value !== undefined ? `${e.title}\n→ ${pick.label}` : e.title), foot: "任务继续运行，完成后推送" });
 }
 const NO_BIND = () => plainText({ head: "⚠️ 未选会话", body: "还没有选定要操作的会话。", foot: "发送 `活跃会话` 选择，或 `创建会话` 新建" });
+/** footer 同款信息：目录(分支)、模型·思考强度、上下文、累计花费、其他扩展的状态项。 */
+async function footerInfo(t) {
+    const s = t.footer ? await t.footer() : null;
+    if (t.kind === "tui" && s) {
+        t.thinkingLevel = typeof s.thinkingLevel === "string" ? s.thinkingLevel : "";
+        if (typeof s.usage?.cost === "number")
+            t.cost = s.usage.cost;
+        if (Array.isArray(s.statuses))
+            t.statuses = new Map(s.statuses.slice(0, 8).map((v, i) => [String(i), stripCtrl(String(v)).slice(0, 80)]));
+        if (s.model)
+            t.model = String(s.model);
+        if (Object.hasOwn(s, "ctxPercent"))
+            t.ctxPercent = typeof s.ctxPercent === "number" && Number.isFinite(s.ctxPercent) && s.ctxPercent >= 0 ? s.ctxPercent : null;
+        if (s.contextWindow > 0)
+            t.contextWindow = s.contextWindow;
+    }
+    const stats = t.kind === "rpc" ? s : null;
+    const branch = gitBranch(t.cwd);
+    const lines = [
+        `目录：${tilde(t.cwd)}${branch ? ` (${branch})` : ""}`,
+        `模型：${t.model || "未知"}${t.thinkingLevel ? ` · ${t.thinkingLevel}` : ""}`,
+        `上下文：${contextLabel(t, stats)}${t.cost > 0 ? ` · 花费 $${t.cost.toFixed(3)}` : ""}`,
+    ];
+    const statuses = [...t.statuses.values()].filter(Boolean);
+    if (statuses.length)
+        lines.push(`附加信息：${statuses.join(" ｜ ")}`);
+    return lines;
+}
 async function statusCard() {
     const t = currentTarget();
     if (!t)
         return NO_BIND();
-    const s = t.stats ? await t.stats() : null;
-    const tok = s?.contextUsage?.tokens;
-    const pct = tok > 0 && s?.contextUsage?.percent != null ? s.contextUsage.percent : null;
-    const context = contextPctLabel(t, s);
+    const info = (await footerInfo(t)).map((l) => `- ${l}`).join("\n");
     const kind = kindOf(t);
     const tunnel = transport.connected ? [] : ["企微：断开"];
-    const text = () => {
-        if (t.busy) {
-            const r = t.run;
-            return plainText({
-                head: `⏳ 运行中 · ${t.label()}`,
-                body: `已运行 ${human(Date.now() - r.startedAt)}，调用 ${r.toolCalls} 次${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。`,
-                foot: [`目录：${tilde(t.cwd)}`, `类型：${kind}`, `上下文：${context}`, ...tunnel, "发送 `停止` 停止"].join(" · "),
-            });
-        }
-        const last = `上次活动 ${ago(t.lastActivity)}`;
+    if (t.busy) {
+        const r = t.run;
         return plainText({
-            head: `🧊 空闲 · ${t.label()}`,
-            body: pct != null ? `上下文已用 ${pct.toFixed(0)}%（${kilo(tok)}），${last}。` : `等你发消息，${last}。`,
-            foot: [`目录：${tilde(t.cwd)}`, `类型：${kind}`, `上下文：${context}`, ...tunnel].join(" · "),
+            head: `⏳ 运行中 · ${t.label()}`,
+            body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。\n\n${info}`,
+            foot: [`类型：${kind}`, ...tunnel, "发送 `停止` 停止"].join(" · "),
         });
+    }
+    return plainText({
+        head: `🧊 空闲 · ${t.label()}`,
+        body: `等你发消息，上次活动 ${ago(t.lastActivity)}。\n\n${info}`,
+        foot: [`类型：${kind}`, ...tunnel].join(" · "),
+    });
+}
+// ---- 默认目录：只影响之后新建的会话（`创建会话` 不带目录时），已有会话不动 ----
+const DEFAULT_DIR_FILE = path.join(DIR, ".default-dir");
+function defaultDir() {
+    try {
+        const d = fs.readFileSync(DEFAULT_DIR_FILE, "utf8").trim();
+        if (d && fs.statSync(d).isDirectory())
+            return d;
+    }
+    catch { }
+    return HOME;
+}
+function setDefaultDir(d) {
+    if (path.resolve(d) === HOME)
+        fs.rmSync(DEFAULT_DIR_FILE, { force: true });
+    else
+        fs.writeFileSync(DEFAULT_DIR_FILE, d + "\n", { mode: 0o600 });
+}
+/** 解析目录参数：别名优先，其次 ~/ 路径或绝对路径；不存在返回 null。 */
+function dirArg(arg) {
+    const d = path.resolve(resolveCwd(arg));
+    try {
+        return fs.statSync(d).isDirectory() ? d : null;
+    }
+    catch {
+        return null;
+    }
+}
+function applyDefaultDir(d, via = "") {
+    setDefaultDir(d);
+    log(`默认目录 → ${tilde(d)}${via ? ` (${via})` : ""}`);
+    return stateCard({
+        tag: "cwd",
+        icon: "📁",
+        title: "切换目录",
+        desc: "之后新建会话默认在此目录，已有会话不受影响",
+        emph: { title: via || path.basename(d) || "~", desc: tilde(d) },
+        emphMax: EMPH_NAME_MAX,
+        fallback: () => plainText({ head: "📁 已切换目录", body: tilde(d), foot: "发送 `创建会话` 在此目录新建 · 已有会话不受影响" }),
+    });
+}
+function buildDirCard(arg) {
+    const aliases = dirAliases();
+    const cur = defaultDir();
+    if (arg) {
+        const hit = Object.hasOwn(aliases, arg.toLowerCase()) ? arg.toLowerCase() : "";
+        const d = dirArg(arg);
+        if (!d)
+            return plainText({ head: "⚠️ 切换目录失败", body: `找不到目录：${clip(arg, 40)}`, foot: "发送 `目录` 从别名中选择" });
+        return applyDefaultDir(d, hit);
+    }
+    const rows = [["~", HOME], ...Object.entries(aliases).map(([n, d]) => [n, path.resolve(expandPath(d))])]
+        .filter(([n, d], i) => i === 0 || fs.existsSync(d))
+        .slice(0, VOTE_OPT_MAX);
+    if (rows.length <= 1) {
+        return plainText({
+            head: `📁 当前目录 · ${tilde(cur)}`,
+            body: "还没有配置目录别名。",
+            foot: "在电脑 Pi 执行 `/remote alias` 添加 · 或发送 `目录 ~/路径`",
+        });
+    }
+    const options = rows.map(([n, d]) => ({
+        id: registerPick({ act: "cwd", dir: d, alias: n === "~" ? "" : n }),
+        text: [n, n === "~" ? "" : tilde(d), d === cur ? "← 当前" : ""].filter(Boolean).join(" · "),
+    }));
+    const card = {
+        card_type: "vote_interaction",
+        title: clip("📁 切换目录", 26),
+        desc: clip(`当前 ${tilde(cur)} · 只影响新建会话`, 30),
+        options,
+        mode: 0,
+        submit_text: "切换目录",
+        task_id: taskId("cwd"),
     };
-    return text();
+    return cardBlock(card, "**请选择目录**", () => plainText({
+        head: "⚠️ 卡片发送失败 · 切换目录",
+        body: rows.map(([n, d]) => `${n} · ${tilde(d)}${d === cur ? " · ← 当前" : ""}`).join("\n"),
+        foot: "发送 `目录 别名` 直接切换",
+    }));
+}
+function handleDirPick(pick) {
+    let ok = false;
+    try { ok = fs.statSync(pick.dir).isDirectory(); } catch { }
+    if (!ok)
+        return plainText({ head: "⚠️ 切换目录失败", body: `目录已不存在：${tilde(pick.dir)}`, foot: "发送 `目录` 重新选择" });
+    return applyDefaultDir(pick.dir, pick.alias);
 }
 
 function splitDirAndMsg(rest) {
     const parts = rest.split(/\s+/).filter(Boolean);
-    let cwd = HOME;
+    let cwd = defaultDir();
     let msg = rest;
     if (parts.length) {
         const maybe = parts[0];
@@ -2043,6 +2392,7 @@ function buildCreatedCard(t, note = "") {
         fallback: text,
     });
 }
+const PICK_AGAIN = { model: ["模型", "切换模型"], cwd: ["目录", "切换目录"], think: ["思考强度", "切换思考强度"] };
 async function handleCardCallback({ taskId, optionId }) {
     const pick = cardPicks.get(optionId);
     if (pick?.act === "ui" && pick.taskId === taskId) {
@@ -2050,13 +2400,18 @@ async function handleCardCallback({ taskId, optionId }) {
             return "这张卡片已经提交过。";
         return handleUiPick(pick);
     }
+    const again = PICK_AGAIN[pick?.act];
     if (!pick || pick.taskId !== taskId || Date.now() - pick.at > CARD_TTL_MS) {
-        return pick?.act === "model" ? "这张模型卡片已失效，请发送 `切换模型` 重新选择。" : "这张会话卡片已失效，请发送 `活跃会话` 或 `历史会话` 重新选择。";
+        return again ? `这张${again[0]}卡片已失效，请发送 \`${again[1]}\` 重新选择。` : "这张会话卡片已失效，请发送 `活跃会话` 或 `历史会话` 重新选择。";
     }
     if (consumeTask(taskId))
-        return pick.act === "model" ? "这张卡片已经提交过，请发送 `切换模型` 获取新卡片。" : "这张卡片已经提交过，请发送 `活跃会话` 或 `历史会话` 获取新卡片。";
+        return again ? `这张卡片已经提交过，请发送 \`${again[1]}\` 获取新卡片。` : "这张卡片已经提交过，请发送 `活跃会话` 或 `历史会话` 获取新卡片。";
     if (pick.act === "model")
         return handleModelPick(pick);
+    if (pick.act === "think")
+        return handleThinkPick(pick);
+    if (pick.act === "cwd")
+        return handleDirPick(pick);
     const rows = await buildList({ find: pick.find || "" });
     return applyPick(pick, rows);
 }
@@ -2101,7 +2456,7 @@ async function handleCommand(text, media = [], ack = { media: false }) {
     const { cmd, rest } = parsed;
     if (parsed.alias || parsed.bare)
         log(`${parsed.alias ? `中文说法 ${parsed.alias}` : `免前缀 ${cmd}`} → ${cmd}${rest ? ` ${JSON.stringify(rest.slice(0, 60))}` : ""}`);
-    if (media.length && ["ls", "h", "status", "help", "stop", "model"].includes(cmd)) {
+    if (media.length && ["ls", "h", "status", "help", "stop", "model", "cd", "think", "compact"].includes(cmd)) {
         log(`命令 ${cmd} 不投递内容，${media.length} 个附件未受理（mediaAccepted=false）`);
     }
     if (cmd === "help")
@@ -2149,17 +2504,17 @@ async function handleCommand(text, media = [], ack = { media: false }) {
         }
         const run = t.run;
         if (run)
-            run.stopped = true;
+            run.stopped = run.stopByCmd = true;
         const ok = await t.abort();
         if (!ok) {
             if (run)
-                run.stopped = false;
+                run.stopped = run.stopByCmd = false;
             return plainText({ head: "⚠️ 中断失败", body: t.label(), foot: "发送 `状态` 查看" });
         }
         return plainText({
             head: "⚠️ 已中断",
             body: t.label(),
-            foot: `已运行 ${run ? runFor(run) : "-"} · 已产出的部分稍后推送`,
+            foot: `已运行 ${run ? runFor(run) : "-"}${run?.lastText ? " · 已产出的部分稍后推送" : ""}`,
         });
     }
     if (cmd === "status")
@@ -2170,6 +2525,20 @@ async function handleCommand(text, media = [], ack = { media: false }) {
             return NO_BIND();
         return buildModelCard(t, rest);
     }
+    if (cmd === "think") {
+        const t = currentTarget();
+        if (!t)
+            return NO_BIND();
+        return buildThinkCard(t, rest);
+    }
+    if (cmd === "compact") {
+        const t = currentTarget();
+        if (!t)
+            return NO_BIND();
+        return compactCard(t, rest);
+    }
+    if (cmd === "cd")
+        return buildDirCard(rest);
     return plainText({ head: "⚠️ 未实现的命令", body: cmd, foot: "发送 `帮助` 查看命令" });
 }
 const RUN_STUCK_MS = SILENCE_STEPS_MS[SILENCE_STEPS_MS.length - 1] + 30 * 60000;
@@ -2386,6 +2755,20 @@ async function handleHttp(req, res) {
         const run = t?.runById?.(o.runId);
         if (run && !run.settled && o.accepted)
             run.stopped = true;
+        return json(res, 200, { ok: true });
+    }
+    if (p === "/meta-ack" && req.method === "POST") {
+        let o = {};
+        try {
+            o = JSON.parse(await readBody(req));
+        }
+        catch { }
+        const t = targets.get(o.key);
+        const w = metaAcks.get(o.reqId);
+        if (t && w && w.key === t.key) {
+            metaAcks.delete(o.reqId);
+            w.resolve(o);
+        }
         return json(res, 200, { ok: true });
     }
     if (p === "/model-ack" && req.method === "POST") {

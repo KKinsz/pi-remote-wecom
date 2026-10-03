@@ -52,10 +52,12 @@ const startupUi=process.cwd().endsWith('startup-ui');
 if(startupUi) emit({type:'extension_ui_request',id:'boot',method:'confirm',title:'启动授权'});
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const c=JSON.parse(line);
- let model=globalThis.model||{provider:'syn',id:'synthetic-model'};
- const models=[{provider:'syn',id:'synthetic-model'},{provider:'syn',id:'synthetic-fast',name:'Synthetic Fast'},{provider:'other',id:'hidden-model'}];
+ let model=globalThis.model||{provider:'syn',id:'synthetic-model',reasoning:true};
+ const models=[{provider:'syn',id:'synthetic-model',reasoning:true},{provider:'syn',id:'synthetic-fast',name:'Synthetic Fast'},{provider:'other',id:'hidden-model'}];
  if(c.type==='set_model') globalThis.model=model=models.find(m=>m.provider===c.provider&&m.id===c.modelId);
- const data=c.type==='get_state'?{sessionId:sid,sessionFile:'',model}:c.type==='get_available_models'?{models}:c.type==='set_model'?model:{};
+ if(c.type==='set_thinking_level') globalThis.level=c.level==='max'?'high':c.level;
+ const levels=model.reasoning?['off','minimal','low','medium','high']:['off'];
+ const data=c.type==='get_state'?{sessionId:sid,sessionFile:'',model,thinkingLevel:globalThis.level||'medium'}:c.type==='get_available_models'?{models}:c.type==='set_model'?model:c.type==='get_available_thinking_levels'?{levels}:c.type==='compact'?{tokensBefore:150000,estimatedTokensAfter:32000,summary:c.customInstructions||''}:{};
  if(startupUi) return;
  if(c.type==='extension_ui_response'){const p=globalThis.waits?.[c.id]; if(p){delete globalThis.waits[c.id]; p(c);} return;}
  emit({type:'response',id:c.id,command:c.type,success:true,data});
@@ -114,13 +116,25 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const selected=await api('/command',{text:'select 1'});
     assert.equal(selected.reply.card.horizontal_content_list.find(x=>x.keyname==='上下文').value,expected);
   }
-  const status=await api('/command',{text:'状态'}); assert.equal(typeof status.reply,'string'); assert.match(status.reply,/上下文：/);
+  // Status pulls footer info from the terminal extension: thinking level, cost and other extensions' statuses.
+  const statusP=api('/command',{text:'状态'});
+  const metaAsk=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='get_meta'));
+  await api('/meta-ack',{key:a.key,reqId:metaAsk.reqId,model:'test-model',thinkingLevel:'high',usage:{cost:0.1234},statuses:['额度 72%']});
+  const status=await statusP; assert.equal(typeof status.reply,'string');
+  assert.match(status.reply,/上下文：/); assert.match(status.reply,/test-model · high/);
+  assert.match(status.reply,/花费 \$0\.123/); assert.match(status.reply,/附加信息：额度 72%/);
+  assert.doesNotMatch(status.reply,/调用 \d+ 次/);
   const help=await api('/command',{text:'帮助'});
   assert.match(help.reply,/^\*\*📖 命令表\*\*/);
   assert.match(help.reply,/^\*\*Tips\*\*\n\n`1\. /m);
   assert.match(help.reply,/`2\. .*\/tabmodel/);
   assert.doesNotMatch(help.reply,/select/);
   assert.match(help.reply,/历史会话 关键词/); assert.doesNotMatch(help.reply,/\.(ls|h|n|nb|status|help|stop)/);
+  // Short alias words replace the long ones in the panel.
+  assert.match(help.reply,/\| model \[关键词\] \| 模型 \[关键词\] \|/);
+  assert.match(help.reply,/\| think \[强度\] \| 思考强度 \[强度\] \|/);
+  assert.match(help.reply,/\| cd \[别名\] \| 目录 \[别名\] \|/);
+  assert.doesNotMatch(help.reply,/切换模型 \[关键词\]/);
   // Removed dot commands and bare numbers are ordinary conversation text.
   for (const text of ['.ls','.h','.n','.nb','.stop','.status','.help','.2','.活跃会话','。帮助','2','状态不对','help me']) {
     await api('/command',{text});
@@ -163,6 +177,15 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   // Used/forged task id cannot select an arbitrary option.
   cardSelect(card); await until(()=>sent.some(x=>x.markdown?.content.includes('已经提交过')));
   assert.equal((await api('/health')).current,b.key);
+  // A bare alias word is itself a command; only a word that merely starts with an alias, or joins it
+  // to the argument without whitespace, is delivered as ordinary conversation.
+  const aliasProbes=['模型hidden','目录proj','思考强度high','模型跑得怎么样','目录下有什么','思考强度不够','新建后台会话了'];
+  // Send without awaiting each response: an unconsumed delivery to this TUI waits out the 2s sync
+  // window, so seven sequential sends add that wait seven times. Commands that answer directly and
+  // deliveries that settle early return sooner; the point here is that serial sends only add latency.
+  await Promise.all(aliasProbes.map(text=>api('/command',{text})));
+  const routed=await api(`/poll?key=${b.key}`);
+  assert.deepEqual(routed.messages.map(m=>m.text).sort(),[...aliasProbes].sort());
   const background = await api('/command',{text:'创建后台会话 home 后台任务甲'});
   assert.equal(background.reply.card.card_type,'text_notice');
   assert.equal(background.reply.card.horizontal_content_list.find(x=>x.keyname==='模型').value,'synthetic-model');
@@ -175,7 +198,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   // Alias table edited by hand applies to the running daemon without restart.
   const aliasDir=fs.mkdtempSync(path.join(dir,'alias-target-'));
   fs.writeFileSync(path.join(dir,'aliases.json'),JSON.stringify({proj:aliasDir}));
-  const aliased=await api('/command',{text:'创建后台会话 proj 别名任务'});
+  const aliased=await api('/command',{text:'新建后台会话 proj 别名任务'});
   await until(()=>sent.some(x=>x.markdown?.content.includes('后台结果：别名任务')));
   assert.match(aliased.reply.card.main_title.title,/创建会话/);
   assert.ok((await api('/health')).targets.some(x=>x.cwd===aliasDir));
@@ -187,17 +210,31 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const modelCard=(await api('/command',{text:'model'})).reply.card;
   assert.equal(modelCard.card_type,'vote_interaction');
   assert.deepEqual(modelCard.options.map(o=>o.text),['synthetic-model · syn · ← 当前','Synthetic Fast · syn']);
-  assert.match(modelCard.desc,/可选 2 个 · 发「切换模型 关键词」筛选所有模型/);
+  assert.match(modelCard.desc,/可选 2 个 · 发「模型 关键词」筛选所有模型/);
   message('model'); const nativeModel=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('切换模型')&&x.template_card.checkbox).at(-1)?.template_card);
   socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:nativeModel.task_id,selected_items:{selected_item:[{question_key:nativeModel.task_id,option_ids:{option_id:[nativeModel.checkbox.option_list[1].id]}}]}}}}}));
   const switched=await until(()=>sent.find(x=>x.template_card?.card_type==='text_notice'&&x.template_card.main_title.title.includes('切换模型'))?.template_card);
   assert.equal(switched.emphasis_content.title,'Synthetic Fast');
   assert.match((await api('/command',{text:'切换模型'})).reply.card.options[1].text,/← 当前/);
+  assert.equal((await api('/command',{text:'模型 synthetic-model'})).reply.card.emphasis_content.title,'synthetic-model');
   const direct=await api('/command',{text:'切换模型 synthetic-model'});
   assert.equal(direct.reply.card.emphasis_content.title,'synthetic-model');
   assert.match((await api('/command',{text:'model 不存在'})).reply,/没有匹配的模型/);
   // Keyword search covers all authenticated models, beyond the enabledModels scope.
   assert.equal((await api('/command',{text:'model hidden'})).reply.card.emphasis_content.title,'hidden-model');
+  // Background RPC thinking level: card lists the model's levels, pick/direct switch via set_thinking_level.
+  assert.match((await api('/command',{text:'切换思考强度'})).reply,/当前模型不支持思考强度/); // hidden-model has no reasoning
+  await api('/command',{text:'切换模型 synthetic-model'});
+  const thinkCard=(await api('/command',{text:'切换思考强度'})).reply.card;
+  assert.equal(thinkCard.card_type,'vote_interaction');
+  assert.deepEqual(thinkCard.options.map(o=>o.text),['off · 关闭','minimal · 最低','low · 低','medium · 中 · ← 当前','high · 高']);
+  assert.equal((await api('/command',{text:'think 高'})).reply.card.emphasis_content.title,'high · 高');
+  assert.match((await api('/command',{text:'切换思考强度'})).reply.card.options[4].text,/← 当前/);
+  assert.match((await api('/command',{text:'think max'})).reply,/当前模型不支持：max[\s\S]*可选：off/);
+  assert.match((await api('/command',{text:'思考强度 low'})).reply.card.main_title.title,/切换思考强度/);
+  // Manual compaction on a background RPC session.
+  assert.equal((await api('/command',{text:'压缩 保留代码改动'})).reply.card.emphasis_content.title,'150k → 32.0k');
+  assert.equal((await api('/command',{text:'compact'})).reply.card.main_title.title,'🗜️ 压缩会话');
   // TUI: models come from registration; switch is delivered through poll and confirmed by /model-ack.
   await api('/register',{mode:'tui',sessionId:'A',sessionName:'会话A',cwd:dir,model:'m1',modelProvider:'p',models:[{provider:'p',id:'m1'},{provider:'p',id:'m2'}],allModels:[{provider:'p',id:'m1'},{provider:'p',id:'m2'},{provider:'q',id:'m3-extra'}],modelScoped:true});
   await api('/command',{text:'ls'}); const liveCard=(await api('/command',{text:'ls'})).reply.card;
@@ -217,6 +254,22 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const ask2=await until(async()=>{const r=await api(`/poll?key=${a.key}`); return r.messages?.find(m=>m.type==='set_model');});
   await api('/model-ack',{key:a.key,reqId:ask2.reqId,ok:false,error:'未配置认证'});
   assert.match((await failing).reply,/切换模型失败[\s\S]*未配置认证/);
+  // TUI thinking level: levels come from get_meta, switch goes through set_thinking and /meta-ack.
+  const thinkP=api('/command',{text:'think'});
+  const tAsk=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='get_meta'));
+  await api('/meta-ack',{key:a.key,reqId:tAsk.reqId,thinkingLevel:'low',thinkingLevels:['off','low','high','xhigh']});
+  assert.deepEqual((await thinkP).reply.card.options.map(o=>o.text),['off · 关闭','low · 低 · ← 当前','high · 高','xhigh · 超高']);
+  const setP=api('/command',{text:'think xhigh'});
+  const tAsk2=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='get_meta'));
+  await api('/meta-ack',{key:a.key,reqId:tAsk2.reqId,thinkingLevel:'low',thinkingLevels:['off','low','high','xhigh']});
+  const tSet=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='set_thinking'));
+  assert.equal(tSet.level,'xhigh');
+  await api('/meta-ack',{key:a.key,reqId:tSet.reqId,ok:true,thinkingLevel:'xhigh'});
+  assert.equal((await setP).reply.card.emphasis_content.title,'xhigh · 超高');
+  const oldP=api('/command',{text:'think'});
+  const tAsk3=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='get_meta'));
+  await api('/meta-ack',{key:a.key,reqId:tAsk3.reqId,thinkingLevel:'low'});
+  assert.match((await oldP).reply,/扩展版本过旧/);
   // Extension dialogs are forwarded to the phone: background confirm answered by card, then timeout auto-allows.
   const pickUi=(card,label)=>socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:card.task_id,selected_items:{selected_item:[{question_key:card.task_id,option_ids:{option_id:[card.checkbox.option_list.find(o=>o.text===label).id]}}]}}}}}));
   const uiCards=()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('Allow computer use')).map(x=>x.template_card);
@@ -276,7 +329,25 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.match((await api('/command',{text:'小明'})).reply,/已回答[\s\S]*→ 小明/);
   const qa2=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
   assert.deepEqual(qa2,{type:'ui_answer',reqId:'tui-q-2',custom:true,value:'小明'});
-  const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,7); // 2 + 2 alias + 3 confirm sessions
+  // Switch directory: alias picker card sets the default for new sessions only; existing sessions keep their cwd.
+  const cdDir=fs.mkdtempSync(path.join(dir,'cd-target-'));
+  fs.writeFileSync(path.join(dir,'aliases.json'),JSON.stringify({proj:aliasDir,sui:path.join(dir,'startup-ui'),cdt:cdDir,gone:path.join(dir,'missing')}));
+  const cwdBefore=(await api('/health')).targets.map(x=>[x.key,x.cwd]);
+  message('切换目录'); const dirCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('切换目录')&&x.template_card.checkbox).at(-1)?.template_card);
+  const dirOpts=dirCard.checkbox.option_list.map(o=>o.text);
+  assert.ok(dirOpts[0].startsWith('~')); assert.ok(dirOpts.some(t=>t.startsWith('cdt · ')));
+  assert.ok(!dirOpts.some(t=>t.startsWith('gone'))); // missing dirs hidden
+  socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:dirCard.task_id,selected_items:{selected_item:[{question_key:dirCard.task_id,option_ids:{option_id:[dirCard.checkbox.option_list.find(o=>o.text.startsWith('cdt')).id]}}]}}}}}));
+  await until(()=>sent.some(x=>x.template_card?.card_type==='text_notice'&&x.template_card.main_title.title.includes('切换目录')));
+  assert.deepEqual((await api('/health')).targets.filter(x=>cwdBefore.some(([k])=>k===x.key)).map(x=>[x.key,x.cwd]),cwdBefore);
+  await api('/command',{text:'创建后台会话 默认目录任务'});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('后台结果：默认目录任务')));
+  assert.ok((await api('/health')).targets.some(x=>x.cwd===cdDir));
+  assert.match((await api('/command',{text:'切换目录 不存在的目录xyz'})).reply,/找不到目录/);
+  assert.match(JSON.stringify((await api('/command',{text:'cd ~'})).reply),/切换目录/);
+  assert.match((await api('/command',{text:'切换目录'})).reply.card.options[0].text,/← 当前/);
+  assert.match((await api('/command',{text:'目录'})).reply.card.task_id,/^task_cwd_/);
+  const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,8); // 2 + 2 alias + 3 confirm + 1 default-dir sessions
   assert.equal(all.targets.filter(x=>x.kind==='tui').length,2);
   assert.equal(errors,'');
 });
