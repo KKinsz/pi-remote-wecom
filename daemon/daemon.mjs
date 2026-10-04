@@ -1502,6 +1502,9 @@ function watchAsync(t, run) {
     }, 30000);
     run.wait().then(async () => {
         clearInterval(prog);
+        // 用户主动「停止」时，中止引发的 stopReason=error 不是真实失败，否则会在回执后再多推一条「任务失败」。
+        if (run.stopByCmd && !run.aborted)
+            run.error = "";
         // 后台会话被「停止」且没有任何文本产出：「停止」的即时回复已说明，不再推一条「（无文本输出）」。
         if (run.stopByCmd && !run.error && !run.lastText) {
             log(`async stopped-empty target=${t.key} dur=${human((run.endedAt || Date.now()) - run.startedAt)}（不推送）`);
@@ -2543,7 +2546,7 @@ async function handleCommand(text, media = [], ack = { media: false }) {
         return plainText({
             head: "⚠️ 已中断",
             subject: t.label(),
-            body: run?.lastText ? "已产出的部分稍后推送" : "",
+            body: "任务已停止",
             foot: `已运行 ${run ? runFor(run) : "-"}`,
         });
     }
