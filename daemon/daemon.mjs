@@ -1093,6 +1093,18 @@ function renderList(subset, all, title, hint = "") {
         foot: "发送 `选择会话 序号` 直达，如 `选择会话 2`" + hint,
     });
 }
+/** 按显示宽度截断（CJK/全角算 2，其余算 1），用于想在手机上单行显示的引用。 */
+function clipWidth(s, maxW) {
+    const t = String(s ?? "").replace(/\s+/g, " ").trim();
+    const w = (c) => (/[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]|\p{Extended_Pictographic}/u.test(c) ? 2 : 1);
+    let used = 0, out = "";
+    for (const c of Array.from(t)) {
+        const cw = w(c);
+        if (used + cw > maxW - 1 && used + cw + (Array.from(t).length - Array.from(out).length - 1 > 0 ? 1 : 0) > maxW) return out + "…";
+        out += c; used += cw;
+    }
+    return out;
+}
 function clip(s, n) {
     const t = String(s ?? "").replace(/\s+/g, " ").trim();
     const cps = Array.from(t);
@@ -1274,13 +1286,11 @@ function buildHistCard(rows) {
     return cardBlock(card, PICK_LEAD, () => renderList(hist, rows, find ? `检索“${find}”` : "历史会话", find ? "" : " · 发「历史会话 关键词」搜索"));
 }
 const RULE = "---";
-// 三段式：head 只放状态；subject（会话名/对象）作为三级标题置于正文首行；关键信息进 body；foot 只放元信息与引导。
+// 三段式：head 用三级标题，放状态 · subject（会话名/对象）；关键信息进 body；foot 只放元信息与引导。
 function plainText({ head, subject = "", body = "", foot = "", extra = "" }) {
-    const parts = [`**${head}**`];
-    // 标题与正文之间补一行全角空格：企微会折叠连续空行，需要一个可见占位才能拉开间距。
-    const main = [subject ? `### 💬 ${subject}` : "", subject && body ? "\u3000" : "", body].filter(Boolean).join("\n\n");
-    if (main)
-        parts.push("", RULE, "", main);
+    const parts = [`### ${subject ? `${head} · ${clip(subject, 10)}` : head}`];
+    if (body)
+        parts.push("", RULE, "", body);
     if (extra)
         parts.push("", extra);
     if (foot)
@@ -1381,11 +1391,11 @@ function stateCard({ tag, icon, title, desc, emph, emphMax = EMPH_MAX, body = ""
     return cardBlock(card, lead, fallback);
 }
 const runFor = (run) => human((run.endedAt || Date.now()) - run.startedAt);
-function fmtAccepted(t) {
+function fmtAccepted(t, text = "") {
     const foot = [`目录：${tilde(t.cwd)}`];
     if (t.model)
         foot.push(`模型：${t.model}`);
-    return plainText({ head: "⏳ 任务运行中", subject: t.label(), body: "任务已开始运行，完成后推送", foot: foot.join(" · ") });
+    return plainText({ head: "⏳ 运行中", subject: t.label(), body: (text ? `> ${clipWidth(text, 40)}\n\n\u3000\n\n` : "") + "已送达，完成后推送", foot: foot.join(" · ") });
 }
 function fmtFail(t, run) {
     return plainText({
@@ -1424,7 +1434,7 @@ async function deliverAndWait(t, text, ack) {
     const which = await Promise.race([run.wait().then(() => "DONE"), timeout]);
     if (which === "DONE") {
         if (run.watched)
-            return fmtAccepted(t);
+            return fmtAccepted(t, text);
         if (run.error)
             return fmtFail(t, run);
         const stats = t.stats ? await t.stats() : null;
@@ -1440,7 +1450,7 @@ async function deliverAndWait(t, text, ack) {
         return msg;
     }
     watchAsync(t, run);
-    return fmtAccepted(t);
+    return fmtAccepted(t, text);
 }
 async function deliverAsync(t, text, ack) {
     t.lastActivity = Date.now();
@@ -1488,7 +1498,7 @@ function watchAsync(t, run) {
         const body = sent >= SILENCE_STEPS_MS.length
             ? `${ran}，连续 ${step} 没有动作，可能卡住了，之后不再提醒。`
             : `${ran}，${step} 没有新动作${run.lastTool ? `，最后一个动作是 ${run.lastTool}` : ""}。`;
-        sendText(plainText({ head: "⏳ 任务运行中", subject: t.label(), body, foot: "发送 `状态` 查看详情，或 `停止` 停止" }));
+        sendText(plainText({ head: "⏳ 运行中", subject: t.label(), body, foot: "发送 `状态` 查看详情，或 `停止` 停止" }));
     }, 30000);
     run.wait().then(async () => {
         clearInterval(prog);
@@ -2103,7 +2113,7 @@ async function statusCard() {
     if (t.busy) {
         const r = t.run;
         return plainText({
-            head: "⏳ 任务运行中",
+            head: "⏳ 运行中",
             subject: t.label(),
             body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。\n\n${info}`,
             foot: [`类型：${kind}`, ...tunnel, "发送 `停止` 停止"].join(" · "),

@@ -285,7 +285,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   // A run that ends while its dialog is pending retires the card: no later "timed out, auto-allowed".
   await api('/command',{text:'创建后台会话 proj 确认后结束'});
   const endCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('结束前确认')).at(-1)?.template_card);
-  await until(()=>sent.some(x=>/已中断[\s\S]*### 💬 .*确认后结束/.test(x.markdown?.content||'')));
+  await until(()=>sent.some(x=>/### .*已中断.*确认后结束/.test(x.markdown?.content||'')));
   pickUi(endCard,'允许'); await until(()=>sent.filter(x=>x.markdown?.content.includes('这个请求已经处理过')).length===1);
 
   pickUi(uiCard,'允许'); await until(()=>sent.some(x=>x.markdown?.content.includes('已经提交过')));
@@ -305,7 +305,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const selCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('选择环境')).at(-1)?.template_card);
   assert.deepEqual(selCard.checkbox.option_list.map(o=>o.text),['dev','prod','取消']);
   pickUi(selCard,'prod');
-  await until(()=>sent.some(x=>/已选择\*\*[\s\S]*### 💬 会话A/.test(x.markdown?.content||'')&&x.markdown.content.includes('→ prod')));
+  await until(()=>sent.some(x=>/### .*已选择 · 会话A/.test(x.markdown?.content||'')&&x.markdown.content.includes('→ prod')));
   const ans=(await api(`/poll?key=${a.key}`)).messages.find(m=>m.type==='ui_answer');
   assert.deepEqual(ans,{type:'ui_answer',reqId:'tui-ui-1',value:'prod'});
   // Answered on the computer first: the phone card becomes stale.
