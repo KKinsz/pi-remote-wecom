@@ -272,16 +272,43 @@ test('真实嵌套卡片回调读取任务和选项，更新卡片带同一任�
   const calls = []; const f = fixture(t, {onCard: async event => {calls.push(event); return '已选择';}});
   f.transport.accept(f.frame('nested','',{msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:'task',event_key:'submit',selected_items:{selected_item:[{question_key:'task',option_ids:{option_id:['option']}}]}}}}),true);
   await f.transport.inbound;
-  assert.deepEqual(calls,[{taskId:'task',optionId:'option',eventKey:'submit'}]);
+  assert.deepEqual(calls,[{taskId:'task',optionId:'option',optionIds:['option'],eventKey:'submit'}]);
   assert.equal(f.updates[0].task_id,'task');
 });
 
-test('首次连接提示使用指定文案', async t => {
+test('首次连接提示使用指定文案：走 markdown，命令显示为行内代码', async t => {
   const f=fixture(t); const welcomes=[];
   f.client.replyWelcome=async (_frame,body)=>{welcomes.push(body);};
+  f.transport.connected=true;
   f.client.emit('event.enter_chat',f.frame('welcome'));
   await turn();
-  assert.equal(welcomes[0].text.content,'Pi Remote 已连接，发送`帮助`查看命令。');
+  assert.deepEqual(welcomes,[]); // text 欢迎语不渲染 Markdown，不再使用
+  assert.deepEqual(f.sent.map(m=>m.body.markdown?.content),['Pi Remote 已连接，发送 `帮助` 查看命令。']);
+});
+
+test('刚发过消息时进会话不重复欢迎，静默期后恢复；未绑定提示不受影响', async t => {
+  const f=fixture(t); f.transport.connected=true;
+  const welcomes=()=>f.sent.map(m=>m.body.markdown?.content).filter(x=>x?.startsWith('Pi Remote'));
+  f.transport.send('任务完成'); await turn();
+  f.client.emit('event.enter_chat',f.frame('w1')); await turn();
+  assert.deepEqual(welcomes(),[]);
+  f.transport.lastOwnerSendAt=Date.now()-3*60*1000;
+  f.client.emit('event.enter_chat',f.frame('w2')); await turn();
+  assert.deepEqual(welcomes(),['Pi Remote 已连接，发送 `帮助` 查看命令。']);
+  const u=fixture(t); u.config.ownerUserId='';
+  u.transport.lastOwnerSendAt=Date.now();
+  u.client.emit('event.enter_chat',u.frame('w3',undefined,{from:{userid:'someone'}})); await turn();
+  assert.deepEqual(u.sent.map(m=>[m.to,m.body.markdown?.content]),[['someone','尚未绑定。请在电脑 Pi 执行 `/remote bind`，把显示的 6 位绑定码发到这里。']]);
+});
+
+test('重启通知后立即进会话，只出现重启通知一条', async t => {
+  const a=fixture(t); a.transport.start(); a.client.emit('authenticated'); await turn(); a.transport.drain();
+  const b=fixture(t,{},a.dir); const welcomes=[];
+  b.client.replyWelcome=async (_frame,body)=>{welcomes.push(body);};
+  b.transport.start(); b.client.emit('authenticated'); await turn();
+  b.client.emit('event.enter_chat',b.frame('w4')); await turn();
+  assert.deepEqual(b.sent.map(m=>m.body.markdown?.content),['Pi Remote 已重启，企微已连接，发送 `帮助` 查看命令。']);
+  assert.deepEqual(welcomes,[]);
 });
 
 test('连上后主动给主人发一次欢迎，重连不重复', async t => {
@@ -290,7 +317,7 @@ test('连上后主动给主人发一次欢迎，重连不重复', async t => {
   f.client.emit('authenticated'); await turn();
   f.client.emit('authenticated'); await turn();
   const texts=f.sent.map(m=>m.body.markdown?.content);
-  assert.deepEqual(texts,['Pi Remote 已连接，发送`帮助`查看命令。']);
+  assert.deepEqual(texts,['Pi Remote 已连接，发送 `帮助` 查看命令。']);
   assert.equal(f.sent[0].to,'owner');
 });
 test('停机留下重启标记，新进程连上后主动通知一次，且不走欢迎去重', async t => {
@@ -302,7 +329,7 @@ test('停机留下重启标记，新进程连上后主动通知一次，且不�
   const b = fixture(t, {}, a.dir);
   b.transport.start();
   b.client.emit('authenticated'); await turn();
-  assert.deepEqual(b.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已重启，企微已连接，发送`帮助`查看命令。']);
+  assert.deepEqual(b.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已重启，企微已连接，发送 `帮助` 查看命令。']);
   // 标记为一次性：同一进程内的后续重连不再重复通知。
   b.client.emit('authenticated'); await turn();
   assert.equal(b.sent.length, 1);
@@ -312,18 +339,18 @@ test('单纯的网络重连不发重启通知；过期标记被丢弃', async t 
   const f = fixture(t); f.transport.start();
   f.client.emit('authenticated'); await turn();
   f.client.emit('reconnecting'); f.client.emit('authenticated'); await turn();
-  assert.deepEqual(f.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送`帮助`查看命令。']);
+  assert.deepEqual(f.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送 `帮助` 查看命令。']);
   // 隔天才开机：不补发早已无关的通知。
   const stale = fixture(t);
   fs.writeFileSync(stale.transport.restartFile, JSON.stringify({at: Date.now() - 11 * 60 * 1000, botId: 'test-bot'}));
   stale.transport.start(); stale.client.emit('authenticated'); await turn();
-  assert.deepEqual(stale.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送`帮助`查看命令。']);
+  assert.deepEqual(stale.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送 `帮助` 查看命令。']);
   assert.equal(fs.existsSync(stale.transport.restartFile), false);
   // 换了机器人（换了配置）也不能把标记算在自己头上。
   const other = fixture(t);
   fs.writeFileSync(other.transport.restartFile, JSON.stringify({at: Date.now(), botId: 'another-bot'}));
   other.transport.start(); other.client.emit('authenticated'); await turn();
-  assert.deepEqual(other.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送`帮助`查看命令。']);
+  assert.deepEqual(other.sent.map(m=>m.body.markdown?.content), ['Pi Remote 已连接，发送 `帮助` 查看命令。']);
 });
 test('未绑定：绑定码错误计次作废，正确码绑定首个发送者且不触达 Pi', async t => {
   const {createBindCode} = await import('../daemon/config.mjs');
@@ -403,5 +430,5 @@ test('绑定成功卡片发送失败时降级为文字', async t => {
   f.client.sendMessage = async (to, body) => { if (body.msgtype === 'template_card') throw Error('unsupported'); return original(to, body); };
   f.transport.accept(f.frame('fb', createBindCode(f.dir)));
   await f.transport.inbound; await turn();
-  assert.ok(f.sent.some(m => m.to === 'owner' && m.body.markdown?.content === '绑定成功，Pi Remote 已连接，发送`帮助`查看命令。'));
+  assert.ok(f.sent.some(m => m.to === 'owner' && m.body.markdown?.content === '绑定成功，Pi Remote 已连接，发送 `帮助` 查看命令。'));
 });

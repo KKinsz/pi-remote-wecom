@@ -14,7 +14,7 @@ async function until(fn, ms = 7000) {
 }
 async function freePort() {const s = net.createServer(); await new Promise(r => s.listen(0,'127.0.0.1',r)); const p = s.address().port; await new Promise(r=>s.close(r)); return p;}
 
-test('真实 SDK + daemon：多会话选择、回传、去重、中断、历史卡片', {timeout: 60000}, async t => {
+test('真实 SDK + daemon：多会话选择、回传、去重、中断、历史卡片', {timeout: 90000}, async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-wecom-integration-'));
   const port = await freePort();
   const server = new WebSocketServer({host:'127.0.0.1',port:0});
@@ -330,6 +330,34 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.match((await api('/command',{text:'小明'})).reply,/已回答[\s\S]*→ 小明/);
   const qa2=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
   assert.deepEqual(qa2,{type:'ui_answer',reqId:'tui-q-2',custom:true,value:'小明'});
+  // AUQ 多选：卡片为多选模式，勾选项一起交回；长题目先发完整题目，卡片标题用短标签。
+  const pickMany=(card,labels)=>socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:card.task_id,selected_items:{selected_item:[{question_key:card.task_id,option_ids:{option_id:labels.map(l=>card.checkbox.option_list.find(o=>o.text===l).id)}}]}}}}}));
+  const longQ='（1/2）[特性] 这次改动里你希望同时启用哪些能力，按你的优先级来选就好？';
+  await api('/ui-request',{key:a.key,reqId:'tui-q-3',kind:'question',title:longQ,header:'特性',multi:true,options:['A','B','C'],descriptions:['a','',''],allowText:true});
+  const mCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title==='❓ （1/2）特性').at(-1)?.template_card);
+  assert.equal(mCard.checkbox.mode,1); assert.equal(mCard.submit_button.text,'提交'); assert.match(mCard.main_title.desc,/可多选/);
+  assert.ok(sent.some(x=>x.markdown?.content.includes('需要回答')&&x.markdown.content.includes(longQ)));
+  pickMany(mCard,['3. C','1. A · a']);
+  const qa3=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
+  assert.deepEqual(qa3,{type:'ui_answer',reqId:'tui-q-3',indexes:[3,1],values:['C','A']});
+  await until(()=>sent.some(x=>/已选择/.test(x.markdown?.content||'')&&x.markdown.content.includes('→ 3. C')));
+  // 多选卡片什么都没勾 / 勾了取消：按取消交回。
+  await api('/ui-request',{key:a.key,reqId:'tui-q-4',kind:'question',title:'选哪些？',multi:true,options:['A','B'],allowText:true});
+  const m2=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('选哪些')).at(-1)?.template_card);
+  pickMany(m2,['1. A','取消']);
+  const qa4=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
+  assert.deepEqual(qa4,{type:'ui_answer',reqId:'tui-q-4',cancelled:true});
+  // 提问超时：文案说明是跳过这次提问、任务仍在运行，而不是任务被取消。
+  await api('/ui-request',{key:a.key,reqId:'tui-q-5',kind:'question',title:'超时题？',options:['A'],allowText:true});
+  const tCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('超时题')).at(-1)?.template_card);
+  assert.match(tCard.main_title.desc,/未答将跳过提问/);
+  const tMsg=await until(()=>sent.find(x=>x.markdown?.content.includes('超时未答，已跳过提问')),8000);
+  assert.match(tMsg.markdown.content,/任务仍在运行/); assert.doesNotMatch(tMsg.markdown.content,/已自动取消/);
+  const qa5=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));
+  assert.deepEqual(qa5,{type:'ui_answer',reqId:'tui-q-5',cancelled:true});
+  // 认不出的阻塞界面：提醒去电脑处理。
+  assert.equal((await api('/ui-notice',{key:a.key,tool:'weird_picker'})).ok,true);
+  await until(()=>sent.some(x=>x.markdown?.content.includes('电脑端在等你操作')&&x.markdown.content.includes('weird_picker')));
   // Switch directory: alias picker card sets the default for new sessions only; existing sessions keep their cwd.
   const cdDir=fs.mkdtempSync(path.join(dir,'cd-target-'));
   fs.writeFileSync(path.join(dir,'aliases.json'),JSON.stringify({proj:aliasDir,sui:path.join(dir,'startup-ui'),cdt:cdDir,gone:path.join(dir,'missing')}));

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import type {ExtensionAPI, ExtensionContext} from '@earendil-works/pi-coding-agent';
-import {RUN_DIR, loadConfig} from '../daemon/config.mjs';
+import {RUN_DIR, loadConfig, statusKeyAllowed} from '../daemon/config.mjs';
 type Json = Record<string, any>;
 type Runtime = {
   ctx: ExtensionContext; cancelled: boolean; cancel: AbortController;
@@ -10,26 +10,31 @@ type Runtime = {
   runId: string | null; text: string; toolCalls: number; queued: number;
   stopped: boolean; error: string; lastBeat: number;
   phone: boolean; uiWaits: Map<string, (answer: Json) => void>; uiReqs: Map<string, Json>;
-  asking: Asking[];
+  asking: Asking[]; tools: Map<string, string>;
 };
-/** 正在执行的提问工具（pi 示例 question / questionnaire 的参数形状），供 ui.custom 识别。 */
-type Asking = {toolCallId: string; kind: 'question' | 'questionnaire'; args: Json};
-type QOption = {label: string; description?: string; value?: string};
-type Question = {id: string; label: string; prompt: string; options: QOption[]; allowOther: boolean};
+/** 正在执行的提问工具，供 ui.custom 识别：pi 示例 question / questionnaire，以及 AskUserQuestion 类（questions[].question）。 */
+type Asking = {toolCallId: string; kind: 'question' | 'questionnaire' | 'auq'; args: Json};
+type QOption = {label: string; description?: string; value?: string; preview?: string};
+type Question = {id: string; label: string; prompt: string; options: QOption[]; allowOther: boolean; header?: string; multi?: boolean};
 type DialogKind = 'confirm' | 'select' | 'input' | 'editor';
 const UI_PATCHED = Symbol.for('pi-remote-wecom.ui');
 const STATUS_PATCHED = Symbol.for('pi-remote-wecom.status');
+const UNKNOWN_UI_NOTICE_MS = Number(process.env.PI_REMOTE_UI_NOTICE_MS) || 30000;
 const isOptions = (x: unknown): x is QOption[] => Array.isArray(x) && x.every(o => o && typeof o.label === 'string');
 /** 按参数形状识别提问工具，不绑定工具名：question {question, options} / questionnaire {questions[]}。 */
 function askingKind(args: any): Asking['kind'] | null {
   if (args && typeof args.question === 'string' && isOptions(args.options)) return 'question';
-  if (args && Array.isArray(args.questions) && args.questions.length
-    && args.questions.every((q: any) => q && typeof q.prompt === 'string' && isOptions(q.options))) return 'questionnaire';
+  const qs = args && Array.isArray(args.questions) && args.questions.length ? args.questions : null;
+  if (qs?.every((q: any) => q && typeof q.prompt === 'string' && isOptions(q.options))) return 'questionnaire';
+  // AskUserQuestion 类（如 @juicesharp/rpiv-ask-user-question）：{questions: [{question, header, options, multiSelect}]}
+  if (qs?.every((q: any) => q && typeof q.question === 'string' && isOptions(q.options))) return 'auq';
   return null;
 }
 /** 与示例 questionnaire 相同的默认值归一化，保证手机答案交回后 details 与终端作答一致。 */
 function normalizeQuestions(a: Asking): Question[] {
   if (a.kind === 'question') return [{id: 'q', label: 'Q1', prompt: a.args.question, options: a.args.options, allowOther: true}];
+  if (a.kind === 'auq') return a.args.questions.map((q: any, i: number) => ({id: String(i), label: q.header || `Q${i + 1}`,
+    prompt: q.question, options: q.options, allowOther: true, header: typeof q.header === 'string' ? q.header : '', multi: q.multiSelect === true}));
   return a.args.questions.map((q: any, i: number) => ({...q, label: q.label || `Q${i + 1}`, allowOther: q.allowOther !== false}));
 }
 /** 其他扩展 setStatus 的文本带 ANSI 颜色与 Nerd Font 图标：手机上只留可读文字。 */
@@ -107,7 +112,9 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   function footerInfo(r: Runtime) {
     let thinkingLevel = '';
     try {thinkingLevel = r.ctx.model?.reasoning ? String(pi.getThinkingLevel()) : '';} catch {}
-    const statuses = [...extStatuses].filter(([k, v]) => k !== r.statusKey && v)
+    let cfg: any = {statusKeys: null};
+    try {cfg = loadConfig();} catch {}
+    const statuses = [...extStatuses].filter(([k, v]) => k !== r.statusKey && v && statusKeyAllowed(cfg, k))
       .sort(([a], [b]) => a.localeCompare(b)).map(([, v]) => v).slice(0, 8);
     return {thinkingLevel, thinkingLevels: thinkingLevels(r.ctx.model), usage: usageTotals(r.ctx), statuses};
   }
@@ -136,7 +143,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     // 兜底：daemon 重启会丢掉手机侧计时，本地按同一策略到点处理（略晚于 daemon，正常情况下不会触发）。
     let fallback: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<{local: false; value: Json}>(resolve => {
-      let remoteConfirm = 'ask-then-allow', remoteConfirmTimeoutMs = 180000;
+      let remoteConfirm = 'ask-then-allow', remoteConfirmTimeoutMs = 600000;
       try {({remoteConfirm, remoteConfirmTimeoutMs} = loadConfig());} catch {}
       if (opts?.timeout > 0 && opts.timeout < remoteConfirmTimeoutMs) return; // 扩展自带更短超时，交给 Pi
       fallback = setTimeout(() => resolve({local: false, value: kind === 'confirm' ? {confirmed: remoteConfirm !== 'ask'} : {cancelled: true}}), remoteConfirmTimeoutMs + 5000);
@@ -167,11 +174,20 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   function remoteCustom(ui: any, orig: Function, factory: Function, options: any) {
     // 提问工具不限手机轮次：模型主动提问时人可能已离开电脑，电脑发起的轮次也推到手机。
     const r = active; const asking = r?.asking.shift(); // 一次工具调用只接管第一个 custom
-    if (!r || !asking || r.cancelled || !r.key || !r.runId) return orig.call(ui, factory, options);
+    if (!r || !asking || r.cancelled || !r.key || !r.runId) {
+      const local = orig.call(ui, factory, options);
+      if (r && !asking) noticeUnknown(r, local);
+      return local;
+    }
     let done: ((v: any) => void) | undefined;
-    const wrapped = (tui: any, theme: any, kb: any, d: (v: any) => void) => {done = d; return factory(tui, theme, kb, d);};
+    let closed = false;
+    const wrapped = (tui: any, theme: any, kb: any, d: (v: any) => void) => {
+      done = d; return factory(tui, theme, kb, (v: any) => {closed = true; d(v);});
+    };
     let localDone = false;
     const local: Promise<any> = Promise.resolve(orig.call(ui, wrapped, options)).finally(() => {localDone = true;});
+    // 组件挂载时立即自行关闭（如 AUQ 发现已有浮层，让出后改用浮层重新挂载）：这次不算提问，留给下一次 custom。
+    if (closed) {r.asking.unshift(asking); return local;}
     const LOCAL = Symbol('local');
     const localWin = local.then(() => LOCAL, () => LOCAL);
     void (async () => {
@@ -181,8 +197,10 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
       for (let i = 0; i < questions.length && !localDone; i++) {
         const q = questions[i];
         const step = questions.length > 1 ? `（${i + 1}/${questions.length}）` : '';
-        const req = await askPhone(r, 'question', {title: `${step}${q.prompt}`, options: q.options.map(o => o.label),
-          descriptions: q.options.map(o => o.description || ''), allowText: q.allowOther});
+        const tag = q.header ? `[${q.header}] ` : '';
+        const req = await askPhone(r, 'question', {title: `${step}${tag}${q.prompt}`, options: q.options.map(o => o.label),
+          descriptions: q.options.map(o => [o.description || '', o.preview ? '含预览，详见电脑' : ''].filter(Boolean).join(' · ')),
+          allowText: q.allowOther, multi: !!q.multi, ...(q.header ? {header: q.header} : {})});
         if (!req) return;
         const a = await Promise.race([req.answer, localWin]);
         r.uiWaits.delete(req.reqId); r.uiReqs.delete(req.reqId);
@@ -190,19 +208,50 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
         const v = a as Json;
         if (v.lost) return;
         if (v.cancelled) {cancelled = true; break;}
+        const text = typeof v.value === 'string' ? v.value.trim() : '';
+        if (q.multi && !v.custom && Array.isArray(v.indexes)) {
+          const picked = [...new Set(v.indexes.map(Number))].filter(n => n >= 1 && n <= q.options.length).sort((x, y) => x - y);
+          if (!picked.length) {cancelled = true; break;}
+          answers.push({q, i, multi: picked.map(n => q.options[n - 1].label)});
+          continue;
+        }
         const idx = Number(v.index);
         const opt = !v.custom && idx >= 1 ? q.options[idx - 1] : undefined;
-        if (opt) answers.push({id: q.id, value: opt.value ?? opt.label, label: opt.label, wasCustom: false, index: idx});
-        else if (q.allowOther && typeof v.value === 'string' && v.value.trim()) answers.push({id: q.id, value: v.value.trim(), label: v.value.trim(), wasCustom: true});
+        if (opt) answers.push({q, i, opt, index: idx});
+        else if (q.allowOther && text) answers.push({q, i, text});
         else {cancelled = true; break;}
       }
       if (localDone || !done) return;
+      if (asking.kind === 'auq') {
+        // 与 rpiv-ask-user-question 的 QuestionnaireResult 同形，工具按原逻辑生成给模型的回答。
+        done({cancelled, answers: answers.map(({q, i, opt, text, multi}) => multi
+          ? {questionIndex: i, question: q.prompt, kind: 'multi', answer: null, selected: multi}
+          : opt ? {questionIndex: i, question: q.prompt, kind: 'option', answer: opt.label, ...(opt.preview ? {preview: opt.preview} : {})}
+          : {questionIndex: i, question: q.prompt, kind: 'custom', answer: text})});
+        return;
+      }
+      const flat = answers.map(({q, opt, text, index}) => opt
+        ? {id: q.id, value: opt.value ?? opt.label, label: opt.label, wasCustom: false, index}
+        : {id: q.id, value: text, label: text, wasCustom: true});
       if (asking.kind === 'question') {
-        const a = answers[0];
+        const a = flat[0];
         done(cancelled || !a ? null : a.wasCustom ? {answer: a.label, wasCustom: true} : {answer: a.label, wasCustom: false, index: a.index});
-      } else done({questions, answers, cancelled});
+      } else done({questions, answers: flat, cancelled});
     })().catch(() => {});
     return local;
+  }
+  /**
+   * 认不出的阻塞界面（未适配的提问工具等）：工具执行中弹出且一段时间没关，提醒手机到电脑上处理，
+   * 避免手机侧只看到「没有新动作」。只提醒一次，不代答。
+   */
+  function noticeUnknown(r: Runtime, local: Promise<any>) {
+    if (r.cancelled || !r.key || !r.runId || !r.tools.size) return;
+    const tool = [...r.tools.values()].at(-1) || '';
+    let open = true;
+    const timer = setTimeout(() => {
+      if (open && active === r && r.key && r.runId) void call(r, '/ui-notice', {key: r.key, tool});
+    }, UNKNOWN_UI_NOTICE_MS);
+    void Promise.resolve(local).finally(() => {open = false; clearTimeout(timer);}).catch(() => {});
   }
   function loseUi(r: Runtime) {
     for (const resolve of r.uiWaits.values()) resolve({lost: true});
@@ -291,7 +340,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const cfg = loadConfig();
     const r: Runtime = {ctx, cancelled: false, cancel: new AbortController(), key: null,
       token: '', port: cfg.localPort, statusKey: cfg.statusKey, runId: null, text: '',
-      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: []};
+      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: [], tools: new Map()};
     active = r;
     extStatuses.clear(); // 新会话/重载时 Pi 已清空 footer 状态
     patchUi(ctx.ui);
@@ -414,11 +463,14 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
       active.toolCalls++;
       const kind = askingKind(event?.args);
       if (kind) active.asking.push({toolCallId: event.toolCallId, kind, args: event.args});
+      active.tools.set(event.toolCallId, String(event.toolName || ''));
     }
     beat();
   });
   pi.on('tool_execution_end', (event) => {
-    if (active) active.asking = active.asking.filter(a => a.toolCallId !== event?.toolCallId);
+    if (!active) return;
+    active.asking = active.asking.filter(a => a.toolCallId !== event?.toolCallId);
+    active.tools.delete(event?.toolCallId);
   });
   pi.on('message_end', (event) => {
     const r = active; if (!r || event.message.role !== 'assistant') return;
@@ -435,7 +487,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const body = {key: r.key, runId: id, text: r.text, toolCalls: r.toolCalls,
       stopped: r.stopped, error: r.error, sessionName: pi.getSessionName() || '', ...meta(ctx)};
     // Snapshot before I/O: a new turn must not be wiped by a late result acknowledgement.
-    r.runId = null; r.phone = false; r.asking = [];
+    r.runId = null; r.phone = false; r.asking = []; r.tools.clear();
     for (let i = 0; i < 3 && !r.cancelled; i++) {
       if (await call(r, '/result', body)) break;
       await delay(r, 500 * (i + 1));

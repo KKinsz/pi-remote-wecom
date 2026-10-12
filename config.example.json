@@ -6,7 +6,7 @@
   "terminal": "auto",
   "tabTitleEnabled": true,
   "remoteConfirm": "ask-then-allow",
-  "remoteConfirmTimeoutMs": 180000,
+  "remoteConfirmTimeoutMs": 600000,
   "nameWaitMs": 5000,
   "kittySocket": "",
   "tmuxSession": "pi"

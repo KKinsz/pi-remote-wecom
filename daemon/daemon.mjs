@@ -9,7 +9,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { loadConfig, RUN_DIR, VERSION, validateCredentials, ensureToken, saveOwner } from "./config.mjs";
+import { loadConfig, statusKeyAllowed, RUN_DIR, VERSION, validateCredentials, ensureToken, saveOwner } from "./config.mjs";
 import { resolveTerminal } from "./terminals.mjs";
 import { WeComTransport, MAX_ATTACHMENT_BYTES } from "./wecom.mjs";
 import { loadAliases } from "./aliases.mjs";
@@ -31,6 +31,7 @@ const NAME_WAIT_MS = Number.isFinite(CFG.nameWaitMs) ? CFG.nameWaitMs : 5000;
 const RPC_IDLE_REAP_MS = 2 * 60 * 60000;
 const SILENCE_STEPS_MS = [10 * 60000, 30 * 60000, 60 * 60000];
 const HIST_LIST = 15;
+const SUBAGENT_NAME_RE = /^[\w-]+#[0-9a-f]{8}$/;
 const HIST_FIND_MAX = 20;
 const VOTE_OPT_MAX = 20;
 const CARD_TTL_MS = 30 * 60000;
@@ -282,6 +283,7 @@ async function sessionMeta(file) {
     let cwd = HOME;
     let id = "";
     let firstUser = "";
+    let hasParent = false;
     let fh;
     try {
         fh = await fsp.open(file, "r");
@@ -309,6 +311,8 @@ async function sessionMeta(file) {
             if (o.type === "session") {
                 cwd = o.cwd || cwd;
                 id = o.id || id;
+                if (o.parentSession)
+                    hasParent = true;
             }
             else if (o.type === "session_info" && o.name)
                 name = oneLine(o.name);
@@ -325,7 +329,9 @@ async function sessionMeta(file) {
     const cut = (s) => Array.from(s).slice(0, HIST_NAME_MAX).join("");
     const fields = { name: name.toLowerCase(), user: firstUser.toLowerCase() };
     const hay = [fields.name, fields.user].filter(Boolean).join(" ");
-    return { name: cut(name) || cut(firstUser) || cut(path.basename(file)) || "(未命名)", cwd, id, hay, fields };
+    // subagent 会话：名称形如 explorer#9b4afaa8（旧版无 parentSession，故名称命中即算）。
+    const sub = SUBAGENT_NAME_RE.test(name);
+    return { name: cut(name) || cut(firstUser) || cut(path.basename(file)) || "(未命名)", cwd, id, hay, fields, sub };
 }
 let keySeq = 0;
 const targets = new Map();
@@ -573,6 +579,8 @@ class RpcTarget extends Target {
                 return;
             }
             if (rec.method === "setStatus" && rec.statusKey) {
+                if (!statusKeyAllowed(CFG, rec.statusKey))
+                    return;
                 const text = typeof rec.statusText === "string" ? plainStatus(rec.statusText) : "";
                 if (text)
                     this.statuses.set(String(rec.statusKey), text.slice(0, 80));
@@ -972,7 +980,7 @@ function relevance(meta, terms, find) {
     return score;
 }
 const splitTerms = (s) => String(s || "").toLowerCase().split(/\s+/).filter(Boolean);
-let histStat = { total: 0, matched: 0, find: "" };
+let histStat = { total: 0, matched: 0, find: "", includeSub: false };
 async function buildList(opts = {}) {
     const find = String(opts.find || "").trim();
     const terms = splitTerms(find);
@@ -980,18 +988,30 @@ async function buildList(opts = {}) {
     live.sort((a, b) => b.lastActivity - a.lastActivity);
     const liveFiles = new Set(live.map((t) => t.sessionFile).filter(Boolean));
     const all = (await scanHistory()).filter((h) => !liveFiles.has(h.file));
+    const showSub = !!opts.includeSub;
     let hist = [];
     let metas = [];
     let matched = 0;
     if (!terms.length) {
-        hist = all.slice(0, HIST_LIST);
-        metas = await metasOf(hist);
+        // 默认跳过 subagent 会话：分批读元信息，凑满 HIST_LIST 条为止。
+        for (let i = 0; i < all.length && hist.length < HIST_LIST; i += 40) {
+            const chunk = all.slice(i, i + 40);
+            const cm = await metasOf(chunk);
+            for (let k = 0; k < chunk.length && hist.length < HIST_LIST; k++) {
+                if (!showSub && cm[k].sub)
+                    continue;
+                hist.push(chunk[k]);
+                metas.push(cm[k]);
+            }
+        }
         matched = all.length;
     }
     else {
         const allMetas = await metasOf(all);
         const hits = [];
         for (let k = 0; k < all.length; k++) {
+            if (!showSub && allMetas[k].sub)
+                continue;
             if (!hayMatch(allMetas[k].hay || "", terms))
                 continue;
             hits.push({ h: all[k], meta: allMetas[k], score: relevance(allMetas[k], terms, find) });
@@ -1004,7 +1024,7 @@ async function buildList(opts = {}) {
             metas.push(x.meta);
         }
     }
-    histStat = { total: all.length, matched, find };
+    histStat = { total: all.length, matched, find, includeSub: showSub };
     const rows = [...live];
     for (let k = 0; k < hist.length; k++) {
         const h = hist[k];
@@ -1233,6 +1253,7 @@ const selOpt = (t) => ({
         cwd: t.cwd,
         name: t.name,
         find: histStat.find || "",
+        includeSub: !!histStat.includeSub,
     }),
     text: optText(t),
 });
@@ -1283,12 +1304,12 @@ function buildHistCard(rows) {
     };
     if (find && matched > options.length)
         log(`历史会话 检索 “${find}” 命中 ${matched} 条，列前 ${options.length}`);
-    return cardBlock(card, PICK_LEAD, () => renderList(hist, rows, find ? `检索“${find}”` : "历史会话", find ? "" : " · 发「历史会话 关键词」搜索"));
+    return cardBlock(card, PICK_LEAD, () => renderList(hist, rows, find ? `检索“${find}”` : "历史会话", find ? "" : " · 发 `历史会话 关键词` 搜索"));
 }
 const RULE = "---";
 // 三段式：head 用三级标题，放状态 · subject（会话名/对象）；关键信息进 body；foot 只放元信息与引导。
 function plainText({ head, subject = "", body = "", foot = "", extra = "" }) {
-    const parts = [`### ${subject ? `${head} · ${clip(subject, 10)}` : head}`];
+    const parts = [`### ${subject ? `${head} · ${clipWidth(subject, 32)}` : head}`];
     if (body)
         parts.push("", RULE, "", body);
     if (extra)
@@ -1341,19 +1362,21 @@ function contextPctLabel(t, stats) {
 }
 function fmtDone(t, run, stats) {
     const foot = doneFoot(t, run, stats);
+    const hint = artHint(t);
     const body = (run.lastText || "（无文本输出）").trim();
+    const bodyFull = body + hint;
     const extra = "";
     const state = run.stopped ? "⚠️ 已中断" : "🏁 任务完成";
     const head = state;
     const subject = t.label();
-    const full = plainText({ head, subject, body, foot, extra });
+    const full = plainText({ head, subject, body: bodyFull, foot, extra });
     const fullBytes = Buffer.byteLength(full);
     if (fullBytes <= PUSH_TEXT_MAX_BYTES)
         return full;
     const note = `字数超限，请查看 Markdown。`;
     log(`交付正文 ${fullBytes} UTF-8 字节 > ${PUSH_TEXT_MAX_BYTES} → 转 Markdown 文档`);
     return {
-        text: plainText({ head, subject, body: note, foot, extra }),
+        text: plainText({ head, subject, body: note + hint, foot, extra }),
         doc: {
             name: t.label(),
             cwd: t.cwd,
@@ -1363,7 +1386,7 @@ function fmtDone(t, run, stats) {
         degrade: () => plainText({
             head,
             subject,
-            body: `${truncateUtf8(body, PUSH_TEXT_MAX_BYTES - 400)}\n\n…（共 ${body.length} 字，Markdown 文档上传失败，已截断）`,
+            body: `${truncateUtf8(body, PUSH_TEXT_MAX_BYTES - 400)}\n\n…（共 ${body.length} 字，Markdown 文档上传失败，已截断）${hint}`,
             foot,
         }),
     };
@@ -1522,7 +1545,7 @@ function watchAsync(t, run) {
         await trackedPush(msg);
     });
 }
-const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact", "restart"]);
+const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact", "restart", "art"]);
 const NL_ALIASES = [
     ["帮助", "help", false],
     ["活跃会话", "ls", false],
@@ -1548,6 +1571,8 @@ const NL_ALIASES = [
     ["压缩", "compact", true],
     ["重启服务", "restart", true],
     ["重启", "restart", true],
+    ["产物", "art", false],
+    ["查看产物", "art", false],
 ].sort((a, b) => b[0].length - a[0].length);
 function parseNlAlias(body) {
     for (const [word, cmd, args] of NL_ALIASES) {
@@ -1598,6 +1623,7 @@ const helpText = () => [
     "| model | 模型 |",
     "| think | 思考强度 |",
     "| cd | 目录 |",
+    "| art | 产物 |",
     "| compact | 压缩 |",
     "| status | 状态 |",
     "| stop | 停止 |",
@@ -1921,7 +1947,9 @@ function uiFence(text) {
     const body = truncateUtf8(stripCtrlKeepNl(String(text || "")).trim(), UI_TEXT_MAX_BYTES).replace(/`{3,}/g, "ʼʼʼ");
     return body ? "```\n" + body + "\n```" : "";
 }
-const uiAfterLabel = (kind) => (kind === "confirm" ? (UI_POLICY === "ask-then-allow" ? "自动允许" : "自动拒绝") : "自动取消");
+// 超时去向写清楚是「这次提问/选择」被跳过，而不是任务被取消。
+const uiAfterLabel = (kind) => kind === "confirm" ? (UI_POLICY === "ask-then-allow" ? "自动允许" : "自动拒绝")
+    : kind === "question" ? "跳过提问" : kind === "select" ? "按未选择处理" : "按未填写处理";
 function uiTimeoutAnswer(kind) {
     return kind === "confirm" ? { confirmed: UI_POLICY === "ask-then-allow" } : { cancelled: true };
 }
@@ -1963,7 +1991,8 @@ function openUiPrompt(t, req, reply) {
         }
         const answer = uiTimeoutAnswer(kind);
         if (settleUiPrompt(e, answer))
-            sendText(plainText({ head: `⏱️ 超时未处理，已${uiAfterLabel(kind)}`, subject: who, body: uiFence(title), foot: "任务继续运行，完成后推送" }));
+            sendText(plainText({ head: `⏱️ 超时未${kind === "confirm" ? "处理" : "答"}，已${uiAfterLabel(kind)}`, subject: who, body: uiFence(title),
+                foot: kind === "confirm" ? "任务继续运行，完成后推送" : "任务仍在运行 · Agent 会按「未回答」继续，完成后推送" }));
     };
     e.timer = setTimeout(e.expire, wait);
     e.timer.unref?.();
@@ -1980,6 +2009,7 @@ function openUiPrompt(t, req, reply) {
         const descs = Array.isArray(req.descriptions) ? req.descriptions : [];
         const room = VOTE_OPT_MAX - (req.allowText ? 2 : 1);
         e.allowText = !!req.allowText;
+        e.multi = !!req.multi;
         // 只发卡片：说明并入选项文字。
         options = list.slice(0, room).map((v, i) => [`${i + 1}. ${v}${descs[i] ? ` · ${descs[i]}` : ""}`, { index: i + 1, value: v }]);
         if (e.allowText)
@@ -1987,14 +2017,20 @@ function openUiPrompt(t, req, reply) {
         options.push(["取消", { cancelled: true }]);
         if (list.length > room)
             e.more = list.length - room;
-        const hint = [e.allowText ? "可直接回复文字" : "", e.more ? `另 ${e.more} 项请到电脑选` : "", `${limit}内未答将${after}`].filter(Boolean).join(" · ");
+        const hint = [e.multi ? "可多选" : "", e.allowText ? "可直接回复文字" : "", e.more ? `另 ${e.more} 项请到电脑选` : "", `${limit}内未答将${after}`].filter(Boolean).join(" · ");
+        // 卡片标题只放得下约 26 字：题目被截断时先发完整题目，避免只看到半句话就作答。
+        // 有短标签（AUQ 的 header）时卡片标题改用「步骤 + 标签」，完整题目在前一条消息里。
+        const long = Array.from(`❓ ${title}`).length > 26;
+        if (long)
+            sendText(plainText({ head: "❓ 需要回答", subject: who, body: uiFence(title), foot: e.multi ? "在下方卡片勾选后提交" : "在下方卡片选择" }));
+        const short = long && req.header ? `${title.match(/^（\d+\/\d+）/)?.[0] || ""}${stripCtrl(String(req.header))}` : title;
         const card = {
             card_type: "vote_interaction",
-            title: clip(`❓ ${title}`, 26),
+            title: clip(`❓ ${short}`, 26),
             desc: clip(hint, 30),
             options: options.map(([text, answer]) => ({ id: registerPick({ act: "ui", reqId, answer, label: text }), text: clip(text, 60) })),
-            mode: 0,
-            submit_text: "回答",
+            mode: e.multi ? 1 : 0,
+            submit_text: e.multi ? "提交" : "回答",
             task_id: taskId("ui"),
         };
         void transport.send(cardBlock(card, "", () => plainText({ head: "⚠️ 卡片发送失败", body: `${clip(title, 80)}\n\n${limit}内未答将${after}`, foot: `${e.allowText ? "可直接回复文字作答，或" : "请"}到电脑上处理` })));
@@ -2058,10 +2094,26 @@ function takeTextAnswer(text) {
     log(`ui answered by phone text target=${e.t.key}`);
     return plainText({ head: "✅ 已回答", subject: e.t.label(), body: uiFence(`${e.title}\n→ ${text.trim()}`), foot: "任务继续运行，完成后推送" });
 }
-function handleUiPick(pick) {
+function handleUiPick(pick, picks = [pick]) {
     const e = uiPending.get(pick.reqId);
     if (!e)
         return "这个请求已经处理过（已超时、已在电脑上回答或会话已结束）。";
+    if (e.multi) {
+        // 多选卡片：勾了「取消」即取消；勾了「自己写」转文字作答；否则所有勾选项一起交回。
+        const mine = picks.filter((x) => x?.reqId === pick.reqId);
+        const cancel = mine.find((x) => x.answer.cancelled);
+        const write = mine.find((x) => x.answer.write);
+        const chosen = mine.filter((x) => x.answer.index);
+        if (cancel || (!write && !chosen.length))
+            pick = cancel || { ...pick, answer: { cancelled: true }, label: "取消" };
+        else if (write)
+            pick = write;
+        else {
+            settleUiPrompt(e, { indexes: chosen.map((x) => x.answer.index), values: chosen.map((x) => x.answer.value) });
+            log(`ui answered by phone target=${e.t.key} multi=${chosen.length}`);
+            return plainText({ head: "✅ 已选择", subject: e.t.label(), body: uiFence(`${e.title}\n${chosen.map((x) => `→ ${x.label}`).join("\n")}`), foot: "任务继续运行，完成后推送" });
+        }
+    }
     if (pick.answer.write) {
         e.awaitText = Date.now();
         // 点了「自己写」：重新计时，留出打字时间（扩展自带超时的由 Pi 决定，不延长）。
@@ -2210,6 +2262,140 @@ function buildDirCard(arg) {
         foot: "发送 `目录 别名` 直接切换",
     }));
 }
+// ---- 会话产物：从会话 jsonl 的 write 调用增量提取，by session 维度 ----
+const ART_EXT = new Set([".html", ".htm", ".md", ".pdf", ".docx", ".xlsx", ".pptx", ".png", ".svg"]);
+const ART_LIST_MAX = VOTE_OPT_MAX;
+const ART_SEND_MAX = 50 * 1024 * 1024;
+function artAllowed(p) {
+    if (!ART_EXT.has(path.extname(p).toLowerCase()))
+        return false;
+    const segs = p.split(path.sep);
+    if (segs.includes("node_modules") || segs.includes(".git"))
+        return false;
+    if (/^(\/private)?\/(tmp|var\/folders)\//.test(p))
+        return false;
+    const base = path.basename(p).toLowerCase();
+    return !(base.startsWith(".env") || base.endsWith(".pem") || base.includes("secret"));
+}
+function scanArtifacts(t) {
+    const file = t.sessionFile;
+    if (!file)
+        return [];
+    if (t.artFile !== file) {
+        t.artFile = file;
+        t.artOff = 0;
+        t.artPaths = new Map();
+    }
+    try {
+        const size = fs.statSync(file).size;
+        if (size < t.artOff) {
+            t.artOff = 0;
+            t.artPaths = new Map();
+        }
+        if (size > t.artOff) {
+            const buf = Buffer.alloc(size - t.artOff);
+            const fd = fs.openSync(file, "r");
+            try {
+                fs.readSync(fd, buf, 0, buf.length, t.artOff);
+            }
+            finally {
+                fs.closeSync(fd);
+            }
+            const end = buf.lastIndexOf(10) + 1;
+            for (const line of buf.subarray(0, end).toString("utf8").split("\n")) {
+                if (!line.includes('"name":"write"'))
+                    continue;
+                let rec;
+                try {
+                    rec = JSON.parse(line);
+                }
+                catch {
+                    continue;
+                }
+                const c = rec?.message?.content;
+                if (rec?.type !== "message" || !Array.isArray(c))
+                    continue;
+                for (const part of c) {
+                    if (part?.type !== "toolCall" || part.name !== "write")
+                        continue;
+                    const raw = part.arguments?.path || part.arguments?.file_path;
+                    if (typeof raw !== "string" || !raw)
+                        continue;
+                    const abs = path.resolve(t.cwd || HOME, expandPath(raw));
+                    if (artAllowed(abs))
+                        t.artPaths.set(abs, true);
+                }
+            }
+            t.artOff += end;
+        }
+    }
+    catch { }
+    const out = [];
+    for (const abs of t.artPaths.keys()) {
+        try {
+            const st = fs.statSync(abs);
+            if (st.isFile())
+                out.push({ file: abs, size: st.size, mtime: st.mtimeMs });
+        }
+        catch { }
+    }
+    return out.sort((a, b) => b.mtime - a.mtime);
+}
+function artHint(t) {
+    const n = scanArtifacts(t).length;
+    if (!n || n === t.artHinted)
+        return "";
+    t.artHinted = n;
+    // 与正文之间留一行可见空行（企微会合并普通空行，沿用受理卡的全角空格行）。
+    return `\n\n\u3000\n\n📎 本会话已有 ${n} 个产物，回复 \`产物\` 查看`;
+}
+function fmtSize(n) {
+    return n < 1024 ? `${n}B` : n < 1048576 ? `${(n / 1024).toFixed(0)}KB` : `${(n / 1048576).toFixed(1)}MB`;
+}
+function buildArtCard(t) {
+    const all = scanArtifacts(t);
+    if (!all.length)
+        return plainText({ head: "📎 暂无产物", subject: t.label(), body: "本会话还没有生成 HTML / 文档类文件。", foot: "支持：html md pdf docx xlsx pptx png svg" });
+    const rows = all.slice(0, ART_LIST_MAX);
+    const options = rows.map((r) => ({
+        id: registerPick({ act: "art", file: r.file }),
+        text: clip(`${path.basename(r.file)} · ${fmtSize(r.size)} · ${ago(r.mtime)}`, 60),
+    }));
+    const card = {
+        card_type: "vote_interaction",
+        title: clip("📎 会话产物", 26),
+        desc: clip(all.length > rows.length ? `共 ${all.length} 个 · 仅显示最近 ${rows.length} 个` : `共 ${all.length} 个 · 可多选`, 30),
+        options,
+        mode: 1,
+        submit_text: "发送文件",
+        task_id: taskId("art"),
+    };
+    return cardBlock(card, "**请选择要发送的文件**", () => plainText({
+        head: "📎 会话产物",
+        subject: t.label(),
+        body: rows.map((r) => `- ${tilde(r.file)} · ${fmtSize(r.size)}`).join("\n"),
+        foot: "卡片发送失败，请到电脑上取用",
+    }));
+}
+function sendArtifacts(picks) {
+    const notes = [];
+    for (const pick of picks) {
+        const name = path.basename(pick.file);
+        let st = null;
+        try {
+            st = fs.statSync(pick.file);
+        }
+        catch { }
+        if (!st?.isFile() || !artAllowed(pick.file))
+            notes.push(`${name}：文件已不存在`);
+        else if (st.size > ART_SEND_MAX)
+            notes.push(`${name}：超过 50MB，未发送`);
+        else
+            void transport.send({ file: pick.file });
+    }
+    return notes.length ? plainText({ head: "⚠️ 部分文件未发送", body: notes.join("\n") }) : "";
+}
+
 function handleDirPick(pick) {
     let ok = false;
     try { ok = fs.statSync(pick.dir).isDirectory(); } catch { }
@@ -2425,12 +2611,19 @@ function buildCreatedCard(t, note = "") {
     });
 }
 const PICK_AGAIN = { model: ["模型", "切换模型"], cwd: ["目录", "切换目录"], think: ["思考强度", "切换思考强度"] };
-async function handleCardCallback({ taskId, optionId }) {
+async function handleCardCallback({ taskId, optionId, optionIds = [] }) {
     const pick = cardPicks.get(optionId);
+    if (pick?.act === "art") {
+        if (pick.taskId !== taskId || Date.now() - pick.at > CARD_TTL_MS)
+            return "这张产物卡片已失效，请发送 `产物` 重新获取。";
+        if (consumeTask(taskId))
+            return "这张卡片已经提交过，请发送 `产物` 获取新卡片。";
+        return sendArtifacts((optionIds.length ? optionIds : [optionId]).map((id) => cardPicks.get(id)).filter((x) => x?.act === "art" && x.taskId === taskId));
+    }
     if (pick?.act === "ui" && pick.taskId === taskId) {
         if (consumeTask(taskId))
             return "这张卡片已经提交过。";
-        return handleUiPick(pick);
+        return handleUiPick(pick, (optionIds.length ? optionIds : [optionId]).map((id) => cardPicks.get(id)).filter((x) => x?.act === "ui" && x.taskId === taskId));
     }
     const again = PICK_AGAIN[pick?.act];
     if (!pick || pick.taskId !== taskId || Date.now() - pick.at > CARD_TTL_MS) {
@@ -2444,7 +2637,7 @@ async function handleCardCallback({ taskId, optionId }) {
         return handleThinkPick(pick);
     if (pick.act === "cwd")
         return handleDirPick(pick);
-    const rows = await buildList({ find: pick.find || "" });
+    const rows = await buildList({ find: pick.find || "", includeSub: !!pick.includeSub });
     return applyPick(pick, rows);
 }
 async function handleCommand(text, media = [], ack = { media: false }) {
@@ -2488,15 +2681,17 @@ async function handleCommand(text, media = [], ack = { media: false }) {
     const { cmd, rest } = parsed;
     if (parsed.alias || parsed.bare)
         log(`${parsed.alias ? `中文说法 ${parsed.alias}` : `免前缀 ${cmd}`} → ${cmd}${rest ? ` ${JSON.stringify(rest.slice(0, 60))}` : ""}`);
-    if (media.length && ["ls", "h", "status", "help", "stop", "model", "cd", "think", "compact"].includes(cmd)) {
+    if (media.length && ["ls", "h", "status", "help", "stop", "model", "cd", "think", "compact", "art"].includes(cmd)) {
         log(`命令 ${cmd} 不投递内容，${media.length} 个附件未受理（mediaAccepted=false）`);
     }
     if (cmd === "help")
         return helpText();
     if (cmd === "ls")
         return buildLsCard(await buildList());
-    if (cmd === "h")
-        return buildHistCard(await buildList({ find: rest }));
+    if (cmd === "h") {
+        const m = /^(?:all|全部)(?:\s+|$)(.*)$/i.exec(rest || "");
+        return buildHistCard(await buildList({ find: m ? m[1] : rest, includeSub: !!m }));
+    }
     if (/^\d+$/.test(cmd)) {
         const n = parseInt(cmd, 10);
         const t = await resolveNumber(n);
@@ -2574,6 +2769,12 @@ async function handleCommand(text, media = [], ack = { media: false }) {
     }
     if (cmd === "cd")
         return buildDirCard(rest);
+    if (cmd === "art") {
+        const t = currentTarget();
+        if (!t)
+            return NO_BIND();
+        return buildArtCard(t);
+    }
     return plainText({ head: "⚠️ 未实现的命令", body: cmd, foot: "发送 `帮助` 查看命令" });
 }
 /** 企微重启：回执发出后向自身发 SIGTERM，走优雅退出，由 launchd KeepAlive 拉起。 */
@@ -2865,6 +3066,21 @@ async function handleHttp(req, res) {
             t.inbox.push({ type: "ui_answer", reqId: o.reqId, ...answer });
             t.waiter?.();
         });
+        return json(res, 200, { ok: true });
+    }
+    if (p === "/ui-notice" && req.method === "POST") {
+        // 扩展发现认不出的阻塞界面（未适配的提问工具等）：只提醒去电脑处理。
+        let o = {};
+        try {
+            o = JSON.parse(await readBody(req));
+        }
+        catch { }
+        const t = targets.get(o.key);
+        if (!t || t.kind !== "tui" || !t.alive)
+            return json(res, 410, { error: "unknown target" });
+        const tool = clip(stripCtrl(String(o.tool || "")), 40);
+        log(`ui notice target=${t.key} tool=${JSON.stringify(tool)}`);
+        sendText(plainText({ head: "⌨️ 电脑端在等你操作", subject: t.label(), body: `${tool ? `\`${tool}\` ` : ""}打开了一个手机无法代答的界面，任务会一直等待。`, foot: "请到电脑上处理，或发送 `停止` 停止" }));
         return json(res, 200, { ok: true });
     }
     if (p === "/ui-done" && req.method === "POST") {

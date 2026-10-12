@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {WSClient} from '@wecom/aibot-node-sdk';
-import {WELCOME_FILE, BIND_FILE, BIND_MAX_FAILURES, RESTART_FILE, RESTART_NOTICE_TTL_MS} from './config.mjs';
+import {WELCOME_FILE, BIND_FILE, BIND_MAX_FAILURES, RESTART_FILE, RESTART_NOTICE_TTL_MS, WELCOME_QUIET_MS} from './config.mjs';
 
 export const PENDING_MEDIA_TTL_MS = 5 * 60 * 1000;
 export const MARKDOWN_MAX_BYTES = 20_000;
@@ -41,7 +41,7 @@ export function nativeCard(card) {
   if (card.card_type !== 'vote_interaction') return card;
   return {
     card_type: 'vote_interaction', main_title: {title: card.title, ...(card.desc ? {desc: card.desc} : {})}, task_id: card.task_id,
-    checkbox: {question_key: card.task_id, mode: 0, option_list: card.options},
+    checkbox: {question_key: card.task_id, mode: card.mode === 1 ? 1 : 0, option_list: card.options},
     submit_button: {text: card.submit_text || '选择会话', key: 'submit'},
   };
 }
@@ -114,9 +114,9 @@ const writeJson = (file, value) => {
 /** Exactly one daemon owns the bot. Only the configured owner's direct chat is accepted.
  * Durable outgoing queue is at-least-once: a lost server ACK may cause a duplicate.
  */
-export const WELCOME = 'Pi Remote 已连接，发送`帮助`查看命令。';
-export const RESTART_NOTICE = 'Pi Remote 已重启，企微已连接，发送`帮助`查看命令。';
-export const BIND_DONE = '绑定成功，Pi Remote 已连接，发送`帮助`查看命令。';
+export const WELCOME = 'Pi Remote 已连接，发送 `帮助` 查看命令。';
+export const RESTART_NOTICE = 'Pi Remote 已重启，企微已连接，发送 `帮助` 查看命令。';
+export const BIND_DONE = '绑定成功，Pi Remote 已连接，发送 `帮助` 查看命令。';
 /**
  * 绑定成功卡片（text_notice）。真机实测约束：main_title 必填；card_action 必须是有效跳转（type 0 或缺省会被拒收）。
  * 不用 source，避免与 main_title 重复显示「Pi Remote」。jump_list type 3 = 点击代用户发送 question。
@@ -137,7 +137,7 @@ export class WeComTransport {
     this.config = config; this.dir = dir; this.log = log; this.onBind = onBind;
     this.onMessage = onMessage; this.onCard = onCard;
     this.connected = false; this.reason = '未连接'; this.working = false;
-    this.sequence = 0; this.closed = false; this.inbound = Promise.resolve(); this.pendingMedia = [];
+    this.sequence = 0; this.lastOwnerSendAt = 0; this.closed = false; this.inbound = Promise.resolve(); this.pendingMedia = [];
     this.outDir = path.join(dir, 'outbox'); fs.mkdirSync(this.outDir, {recursive: true, mode: 0o700});
     this.markdownDir = path.join(dir, 'markdown'); fs.mkdirSync(this.markdownDir, {recursive: true, mode: 0o700});
     this.cardsFile = path.join(dir, 'cards.json'); this.cards = new Map();
@@ -168,8 +168,13 @@ export class WeComTransport {
     this.client.on('event.template_card_event', frame => this.accept(frame, true));
     this.client.on('event.enter_chat', frame => {
       if (this.closed || this.draining) return;
-      const content = this.authorized(frame.body) ? WELCOME : !this.bound() && this.bindable(frame.body) ? BIND_HINT : '';
-      if (content) void this.client.replyWelcome(frame, {msgtype: 'text', text: {content}}).catch(() => {});
+      // 刚发过消息（如重启通知、任务回复）时不再叠一条欢迎语；未绑定的绑定提示不受影响。
+      const quiet = Date.now() - this.lastOwnerSendAt < WELCOME_QUIET_MS;
+      const content = this.authorized(frame.body) ? (quiet ? '' : WELCOME) : !this.bound() && this.bindable(frame.body) ? BIND_HINT : '';
+      // 欢迎语回复只支持 text（不渲染 Markdown，反引号会原样显示）：改发 markdown 消息，命令才显示为行内代码。
+      if (!content) return;
+      if (content === WELCOME) void this.send(WELCOME);
+      else void this.client.sendMessage(frame.body.from.userid, {msgtype: 'markdown', markdown: {content}}).catch(() => {});
     });
   }
   /** Proactive welcome once per bot+owner; /remote setup clears the marker so each setup greets again. */
@@ -223,12 +228,12 @@ export class WeComTransport {
     const file = path.join(this.dir, BIND_FILE);
     let pending = null;
     try { pending = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-    if (this.bindLocked) { this.log('绑定：已锁定'); return reply('绑定已锁定，请在电脑 Pi 执行 `/remote bind` 重新获取绑定码。'); }
+    if (this.bindLocked) { this.log('绑定：已锁定'); return reply('绑定已锁定，请在电脑 Pi 执行 `/remote bind`重新获取绑定码。'); }
     const valid = pending && typeof pending.code === 'string' && pending.expiresAt > Date.now()
       && (pending.failures || 0) < BIND_MAX_FAILURES;
     const guess = String(text || '').trim();
     if (!/^\d{6}$/.test(guess)) { this.log('绑定：收到非绑定码消息'); return reply(BIND_HINT); }
-    if (!valid) { this.log('绑定：无有效绑定码'); return reply('绑定码无效或已过期。请在电脑 Pi 执行 `/remote bind` 重新获取。'); }
+    if (!valid) { this.log('绑定：无有效绑定码'); return reply('绑定码无效或已过期。请在电脑 Pi 执行 `/remote bind`重新获取。'); }
     const ok = crypto.timingSafeEqual(Buffer.from(guess), Buffer.from(pending.code.padEnd(6).slice(0, 6)));
     if (!ok) {
       pending.failures = (pending.failures || 0) + 1;
@@ -241,7 +246,7 @@ export class WeComTransport {
       }
       this.log(`绑定：绑定码错误 ${pending.failures}/${BIND_MAX_FAILURES}`);
       return reply(pending.failures >= BIND_MAX_FAILURES
-        ? '错误次数过多，绑定码已作废。请在电脑 Pi 执行 `/remote bind` 重新获取。' : '绑定码不正确，请核对电脑上显示的 6 位数字。');
+        ? '错误次数过多，绑定码已作废。请在电脑 Pi 执行 `/remote bind`重新获取。' : '绑定码不正确，请核对电脑上显示的 6 位数字。');
     }
     try { await this.onBind(to); }
     catch { this.log('绑定：写入配置失败'); return reply('电脑端保存绑定失败，请查看 /remote 状态后重试。'); }
@@ -291,6 +296,7 @@ export class WeComTransport {
     else steps.push(...markdownSteps(packet.text || '', this.markdownDir));
     if (packet.file) steps.push({kind: 'file', file: packet.file});
     writeJson(file, {recipient: this.config.ownerUserId, steps, cursor: 0, attempts: 0});
+    this.lastOwnerSendAt = Date.now();
     void this.flush(); return Promise.resolve(true); // true means durably queued, not server-delivered.
   }
   async flush() {
@@ -378,7 +384,7 @@ export class WeComTransport {
     this.inbound = this.inbound.then(async () => {
       if (card) {
         const event = cardEvent(frame.body.event);
-        const reply = await this.onCard({taskId: event.task_id, optionId: selectedIds(event)[0], eventKey: event.event_key});
+        const reply = await this.onCard({taskId: event.task_id, optionId: selectedIds(event)[0], optionIds: selectedIds(event), eventKey: event.event_key});
         await this.send(reply); return;
       }
       const result = await prepared;

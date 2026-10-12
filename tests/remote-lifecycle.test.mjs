@@ -127,6 +127,7 @@ test('TUI 扩展：手机轮次的弹窗转到手机，谁先答用谁；本地�
   local[3].resolve(true); assert.equal(await p3,true);
 });
 test('TUI 扩展：question / questionnaire 工具（ui.custom）转手机，按工具原结果形状交回',async t=>{
+  process.env.PI_REMOTE_UI_NOTICE_MS='30'; t.after(()=>{delete process.env.PI_REMOTE_UI_NOTICE_MS;});
   const {RUN_DIR}=await import('../daemon/config.mjs');const dir=RUN_DIR;fs.mkdirSync(dir,{recursive:true});
   const previous=process.env.PI_REMOTE_HOME;process.env.PI_REMOTE_HOME=dir;
   fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({localPort:18778}));fs.writeFileSync(path.join(dir,'.token'),'token');
@@ -197,4 +198,38 @@ test('TUI 扩展：question / questionnaire 工具（ui.custom）转手机，按
   await until(()=>calls.some(x=>x.endpoint==='/ui-done'&&x.body.reqId===reqs()[4].reqId));
   // Unrelated custom() (no question tool running) is untouched.
   const p5=ui.custom(()=>({}));await tick();assert.equal(reqs().length,5);shown.at(-1).done('ok');assert.equal(await p5,'ok');
+  // AskUserQuestion（@juicesharp/rpiv-ask-user-question 形状）：单选 + 多选 + 自己写，按 QuestionnaireResult 交回。
+  const auq=[{question:'本地优化具体指哪一层？',header:'本地优化含义',options:[{label:'路径不改',description:'只做云端'},{label:'保留既有',description:'不重写',preview:'```ts\nx\n```'}]},
+    {question:'要启用哪些？',header:'特性',multiSelect:true,options:[{label:'A',description:'a'},{label:'B',description:'b'},{label:'C',description:'c'}]},
+    {question:'备注？',header:'备注',options:[{label:'无',description:''},{label:'有',description:''}]}];
+  await hooks.get('tool_execution_start')({toolCallId:'c6',toolName:'ask_user_question',args:{questions:auq}});
+  // 先挂载即让出（已有浮层）：不算提问，下一次挂载才转手机。
+  const y=ui.custom((tui,theme,kb,done)=>{done({answers:[],cancelled:true});return {};});
+  assert.deepEqual(await y,{answers:[],cancelled:true});await tick();assert.equal(reqs().length,5);
+  const p6=ui.custom(()=>({}));await until(()=>reqs().length===6);
+  assert.equal(reqs()[5].title,'（1/3）[本地优化含义] 本地优化具体指哪一层？');assert.equal(reqs()[5].header,'本地优化含义');
+  assert.equal(reqs()[5].multi,false);assert.deepEqual(reqs()[5].descriptions,['只做云端','不重写 · 含预览，详见电脑']);
+  polls.at(-1).reply([{type:'ui_answer',reqId:reqs()[5].reqId,index:2,value:'保留既有'}]);
+  await until(()=>reqs().length===7);assert.equal(reqs()[6].multi,true);
+  polls.at(-1).reply([{type:'ui_answer',reqId:reqs()[6].reqId,indexes:[3,1,3],values:['C','A','C']}]);
+  await until(()=>reqs().length===8);
+  polls.at(-1).reply([{type:'ui_answer',reqId:reqs()[7].reqId,custom:true,value:' 先别动 '}]);
+  assert.deepEqual(await p6,{cancelled:false,answers:[
+    {questionIndex:0,question:'本地优化具体指哪一层？',kind:'option',answer:'保留既有',preview:'```ts\nx\n```'},
+    {questionIndex:1,question:'要启用哪些？',kind:'multi',answer:null,selected:['A','C']},
+    {questionIndex:2,question:'备注？',kind:'custom',answer:'先别动'}]});
+  await hooks.get('tool_execution_end')({toolCallId:'c6'});
+  // AUQ 手机取消：整份问卷取消。
+  await hooks.get('tool_execution_start')({toolCallId:'c7',toolName:'ask_user_question',args:{questions:auq.slice(0,1)}});
+  const p7=ui.custom(()=>({}));await until(()=>reqs().length===9);assert.equal(reqs()[8].title,'[本地优化含义] 本地优化具体指哪一层？');
+  polls.at(-1).reply([{type:'ui_answer',reqId:reqs()[8].reqId,cancelled:true}]);
+  assert.deepEqual(await p7,{cancelled:true,answers:[]});
+  await hooks.get('tool_execution_end')({toolCallId:'c7'});
+  // 认不出的阻塞界面：工具执行中挂着不关，提醒手机去电脑处理；关掉后不提醒。
+  await hooks.get('tool_execution_start')({toolCallId:'c8',toolName:'weird_picker',args:{foo:1}});
+  const p8=ui.custom(()=>({}));
+  await until(()=>calls.some(x=>x.endpoint==='/ui-notice'));
+  assert.equal(calls.find(x=>x.endpoint==='/ui-notice').body.tool,'weird_picker');assert.equal(reqs().length,9);
+  shown.at(-1).done('x');assert.equal(await p8,'x');
+  await hooks.get('tool_execution_end')({toolCallId:'c8'});
 });
