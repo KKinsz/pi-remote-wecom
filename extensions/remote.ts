@@ -451,7 +451,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const r = active; if (!r) return;
     r.runId = randomUUID(); r.text = ''; r.toolCalls = 0; r.stopped = false; r.error = ''; r.lastBeat = 0;
     const local = r.queued === 0; r.queued = 0; r.phone = !local;
-    if (r.key) await call(r, '/turn', {key: r.key, runId: r.runId, prompt: event.prompt.slice(0, 200), local});
+    if (r.key) await call(r, '/turn', {key: r.key, runId: r.runId, prompt: String(event.prompt ?? '').slice(0, 200), local});
   });
   const beat = () => {
     const r = active;
