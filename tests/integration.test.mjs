@@ -75,7 +75,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
 });
 `,{mode:0o700});
   fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({botId:'test-bot',secret:'test-secret',ownerUserId:'owner',localPort:port,
-    piBin:fakePi,remoteConfirmTimeoutMs:5000,wsUrl:`ws://127.0.0.1:${server.address().port}`,agentDir,terminal:'none',inboxDir:path.join(dir,'inbox')}));
+    piBin:fakePi,remoteConfirmTimeoutMs:5000,abortAckMs:2500,wsUrl:`ws://127.0.0.1:${server.address().port}`,agentDir,terminal:'none',inboxDir:path.join(dir,'inbox')}));
   fs.writeFileSync(path.join(dir,'.token'),'local-token');
   fs.writeFileSync(path.join(agentDir,'settings.json'),JSON.stringify({enabledModels:['syn/*']}));
   const child = spawn(process.execPath,['daemon/daemon.mjs'], {cwd:process.cwd(),env:{...process.env,PI_REMOTE_HOME:dir},stdio:['ignore','pipe','pipe']});
@@ -170,6 +170,40 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await api('/result',{key:b.key,runId:'run-B',text:'B的部分结果',stopped:true});
   await until(()=>sent.some(x=>x.markdown?.content.includes('B的部分结果')));
   assert.match(sent.find(x=>x.markdown?.content.includes('B的部分结果')).markdown.content,/已中断/);
+  // Terminal is already idle: the phone-side run is a ghost whose result was lost; settle it with one notice.
+  await api('/turn',{key:b.key,runId:'run-B2',local:true,prompt:'B幽灵轮次'});
+  assert.match((await api('/command',{text:'停止'})).reply,/等待终端确认/);
+  assert.deepEqual((await api(`/poll?key=${b.key}`)).messages,[{type:'abort',runId:'run-B2'}]);
+  await api('/abort-ack',{key:b.key,runId:'run-B2',accepted:false,reason:'idle',currentRunId:null});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('结束消息没能送回')));
+  assert.equal((await api('/result',{key:b.key,runId:'run-B2',text:'迟到'})).stale,true);
+  // Turn not registered on the terminal yet: refused with a hint, the run keeps going.
+  await api('/turn',{key:b.key,runId:'run-B3',local:true,prompt:'B卡住的轮次'});
+  await api('/command',{text:'停止'}); await api(`/poll?key=${b.key}`);
+  await api('/abort-ack',{key:b.key,runId:'run-B3',accepted:false,reason:'unregistered',currentRunId:null});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('还没登记')));
+  // Accepted but the turn never ends, then a resend nobody acknowledges: each overdue check reports once.
+  assert.match((await api('/command',{text:'停止'})).reply,/等待终端确认/); await api(`/poll?key=${b.key}`);
+  await api('/abort-ack',{key:b.key,runId:'run-B3',accepted:true});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('终端已确认中断')));
+  const stoppingStatus=api('/command',{text:'状态'});
+  const stoppingAsk=await until(async()=>(await api(`/poll?key=${b.key}`)).messages?.find(m=>m.type==='get_meta'));
+  await api('/meta-ack',{key:b.key,reqId:stoppingAsk.reqId});
+  assert.match((await stoppingStatus).reply,/终端已确认，等待这一轮结束/);
+  assert.match((await api('/command',{text:'停止'})).reply,/已重发中断请求/);
+  assert.deepEqual((await api(`/poll?key=${b.key}`)).messages,[{type:'abort',runId:'run-B3'}]);
+  await until(()=>sent.some(x=>x.markdown?.content.includes('内没有确认中断')));
+  assert.equal(sent.filter(x=>x.markdown?.content.includes('中断未生效')).length,3);
+  await api('/result',{key:b.key,runId:'run-B3',text:'B3终于停了',stopped:true});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('B3终于停了')));
+  // Pi can start a queued run before the previous one settles; the extension then reports only the newest id.
+  await api('/turn',{key:b.key,runId:'run-B4',local:true,prompt:'continue'});
+  await api('/turn',{key:b.key,runId:'run-B5',local:true,prompt:'continue'});
+  assert.equal((await api('/result',{key:b.key,runId:'run-B4',text:'被顺延的轮次'})).stale,true);
+  await api('/result',{key:b.key,runId:'run-B5',text:'续跑结果'});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('续跑结果')));
+  assert.equal((await api('/command',{text:'停止'})).reply.includes('无需中断'),true);
+  assert.ok(!sent.some(x=>x.markdown?.content.includes('被顺延的轮次')));
   const history=await api('/command',{text:'历史会话 可检索'});
   assert.equal(history.reply.card.options.length,20); // no legacy 1000-character truncation
   const names=history.reply.card.options.map(o=>o.text); assert.ok(names.every(n=>n.includes('可检索')));
@@ -299,11 +333,20 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const started=Date.now(); const boot=await api('/command',{text:'创建后台会话 sui 启动任务'});
   assert.match(boot.reply,/新建失败[\s\S]*启动时请求确认[\s\S]*启动授权/); assert.ok(Date.now()-started<3000);
   // Terminal session: the extension forwards its dialog; phone answer is delivered through poll.
-  await api('/command',{text:'ls'});
+  // Unbound terminal session: nothing reaches the phone; parked prompts are pushed once the session is bound.
   const tuiUi=await api('/ui-request',{key:a.key,reqId:'tui-ui-1',kind:'select',title:'选择环境',options:['dev','prod']});
-  assert.equal(tuiUi.ok,true);
+  assert.deepEqual(tuiUi,{ok:true,parked:true});
+  assert.equal((await api('/ui-request',{key:a.key,reqId:'tui-ui-gone',kind:'confirm',title:'未绑定电脑先答'})).parked,true);
+  await api('/ui-done',{key:a.key,reqId:'tui-ui-gone'});
+  assert.equal((await api('/ui-request',{key:a.key,reqId:'tui-ed-1',kind:'editor',title:'写点什么'})).ok,false);
+  assert.equal((await api('/ui-notice',{key:a.key,tool:'unbound_picker'})).skipped,'not bound');
+  await new Promise(r=>setTimeout(r,200));
+  assert.ok(!sent.some(x=>/选择环境|未绑定电脑先答|写点什么|unbound_picker/.test(JSON.stringify(x))));
+  const bindCard=(await api('/command',{text:'ls'})).reply.card;
+  await api('/command',{text:`选择会话 ${bindCard.options.findIndex(o=>o.text.includes('会话A'))+1}`});
   const selCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('选择环境')).at(-1)?.template_card);
   assert.deepEqual(selCard.checkbox.option_list.map(o=>o.text),['dev','prod','取消']);
+  assert.ok(!sent.some(x=>JSON.stringify(x).includes('未绑定电脑先答')));
   pickUi(selCard,'prod');
   await until(()=>sent.some(x=>/### .*已选择 · 会话A/.test(x.markdown?.content||'')&&x.markdown.content.includes('→ prod')));
   const ans=(await api(`/poll?key=${a.key}`)).messages.find(m=>m.type==='ui_answer');
@@ -318,7 +361,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await api('/ui-request',{key:a.key,reqId:'tui-q-1',kind:'question',title:'用哪个库？',options:['React','Vue'],descriptions:['生态大',''],allowText:true});
   const qCard=await until(()=>sent.filter(x=>x.template_card?.main_title?.title?.includes('用哪个库')).at(-1)?.template_card);
   assert.deepEqual(qCard.checkbox.option_list.map(o=>o.text),['1. React · 生态大','2. Vue','✏️ 自己写（直接回复文字）','取消']);
-  assert.match(qCard.main_title.desc,/可直接回复文字/);
+  assert.match(qCard.main_title.desc,/^会话A · /);
   assert.ok(!sent.some(x=>x.markdown?.content.includes('需要回答'))); // 只发卡片
   pickUi(qCard,'2. Vue');
   const qa=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.type==='ui_answer'));

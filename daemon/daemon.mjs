@@ -30,6 +30,9 @@ const SYNC_WINDOW_MS = 2000;
 const NAME_WAIT_MS = Number.isFinite(CFG.nameWaitMs) ? CFG.nameWaitMs : 5000;
 const RPC_IDLE_REAP_MS = 2 * 60 * 60000;
 const SILENCE_STEPS_MS = [10 * 60000, 30 * 60000, 60 * 60000];
+// 终端会话「停止」后多久仍未结束就提醒用户；拒绝中断后留一点时间给在途的 /result。
+const ABORT_ACK_MS = Number.isFinite(CFG.abortAckMs) ? CFG.abortAckMs : 90000;
+const ABORT_REJECT_GRACE_MS = 3000;
 const HIST_LIST = 15;
 const SUBAGENT_NAME_RE = /^[\w-]+#[0-9a-f]{8}$/;
 const HIST_FIND_MAX = 20;
@@ -347,6 +350,9 @@ class Run {
         this.lastOutputAt = Date.now();
         this.error = null;
         this.aborted = null;
+        this.stopRequestedAt = 0;
+        this.abortAck = null;
+        this.abortTimer = null;
         this.local = false;
         this.watched = false;
         this.settled = false;
@@ -369,6 +375,8 @@ class Run {
             return;
         this.settled = true;
         this.endedAt = Date.now();
+        clearTimeout(this.abortTimer);
+        this.abortTimer = null;
         const w = this._waiters;
         this._waiters = [];
         for (const r of w)
@@ -814,6 +822,21 @@ class RpcTarget extends Target {
         }, 3000);
         targets.delete(this.key);
     }
+    /** 关闭并等进程退出：之后其他进程打开同一会话文件，不会再有它的写入。 */
+    closeAndWait(ms = 5000) {
+        const proc = this.proc;
+        const exited = !proc || proc.exitCode !== null || proc.signalCode !== null
+            ? Promise.resolve()
+            : new Promise((r) => proc.once("exit", r));
+        this.close();
+        return Promise.race([exited, new Promise((r) => setTimeout(r, ms))]);
+    }
+}
+/** 同一会话的后台进程：终端用 pi -r 打开它时据此交接，避免两个进程同时写一个会话文件。 */
+function backgroundOf(sessionFile, sessionId) {
+    const file = sessionFile ? path.resolve(sessionFile) : "";
+    return [...targets.values()].find((x) => x.kind === "rpc" && !x.closed
+        && ((sessionId && x.sessionId === sessionId) || (file && x.sessionFile && path.resolve(x.sessionFile) === file)));
 }
 class TuiTarget extends Target {
     constructor(opts) {
@@ -1050,8 +1073,10 @@ function loadCurrent() {
 }
 function bindCurrent(t) {
     currentKey = t?.key || null;
-    if (t)
+    if (t) {
         watchInflight(t);
+        flushParkedUi(t);
+    }
     const sid = t?.sessionId || "";
     if (sid === currentSessionId)
         return;
@@ -1429,11 +1454,14 @@ function fmtFail(t, run) {
     });
 }
 function fmtAborted(t, run) {
+    const ended = run.aborted === "结束未回传";
     const why = run.aborted === "会话失联" ? "会话失联" : "Pi Bridge 重启";
     return plainText({
-        head: "⚠️ 任务中断",
+        head: ended ? "🧊 无需中断" : "⚠️ 任务中断",
         subject: t.label(),
-        body: `${why}，这一轮的结果没能送回。电脑上的任务可能已经完成。`,
+        body: ended
+            ? "终端已空闲，这一轮其实已经结束，但结束消息没能送回。结果请到电脑上查看。"
+            : `${why}，这一轮的结果没能送回。电脑上的任务可能已经完成。`,
         foot: `目录：${tilde(t.cwd)} · 运行：${runFor(run)} · 发送 \`状态\` 查看`,
     });
 }
@@ -1456,7 +1484,7 @@ async function deliverAndWait(t, text, ack) {
     const timeout = new Promise((res) => setTimeout(() => res("TIMEOUT"), SYNC_WINDOW_MS));
     const which = await Promise.race([run.wait().then(() => "DONE"), timeout]);
     if (which === "DONE") {
-        if (run.watched)
+        if (run.watched || run.superseded)
             return fmtAccepted(t, text);
         if (run.error)
             return fmtFail(t, run);
@@ -1511,6 +1539,8 @@ function watchAsync(t, run) {
     const prog = setInterval(() => {
         if (run.settled || sent >= SILENCE_STEPS_MS.length)
             return clearInterval(prog);
+        if (run.stopped || run.stopRequestedAt)
+            return;
         const silent = Date.now() - run.lastOutputAt;
         if (silent < SILENCE_STEPS_MS[sent])
             return;
@@ -1525,6 +1555,8 @@ function watchAsync(t, run) {
     }, 30000);
     run.wait().then(async () => {
         clearInterval(prog);
+        if (run.superseded)
+            return;
         // 用户主动「停止」时，中止引发的 stopReason=error 不是真实失败，否则会在回执后再多推一条「任务失败」。
         if (run.stopByCmd && !run.aborted)
             run.error = "";
@@ -1544,6 +1576,84 @@ function watchAsync(t, run) {
             (typeof msg === "string" ? "" : " +md"));
         await trackedPush(msg);
     });
+}
+/** 正在跑的轮次：t.run 已结束时取最近一个未结束的 loop。 */
+function pendingRun(t) {
+    if (t.run && !t.run.settled)
+        return t.run;
+    return [...(t.loops?.values?.() || [])].reverse().find((r) => !r.settled) || null;
+}
+/** 扩展同一时刻只跟踪一个轮次：Pi 一次忙碌里可连开多轮、只在最后 settle 一次，被顺延的轮次再也收不到 /result。 */
+function supersedeLoops(t, runs, by) {
+    for (const r of runs) {
+        if (r === by || r.settled)
+            continue;
+        r.superseded = true;
+        r.settle();
+        log(`loop superseded target=${t.key} id=${r.id} by=${by?.id || "-"} idle=${human(Date.now() - r.lastOutputAt)}`);
+    }
+}
+function settleLost(t, run) {
+    run.settle();
+    t.noteSettled?.(run);
+    if (!run.watched)
+        void trackedPush(fmtAborted(t, run));
+}
+/** 终端会话的中断经轮询送达：重发不重置首次请求时间，也不推迟已在计时的提醒。 */
+function requestTuiAbort(t, run) {
+    run.stopRequestedAt ||= Date.now();
+    run.abortAck = null;
+    t.inbox.push({ type: "abort", runId: run.id });
+    t.waiter?.();
+    if (run.abortTimer)
+        return;
+    run.abortTimer = setTimeout(() => {
+        run.abortTimer = null;
+        abortOverdue(t, run);
+    }, ABORT_ACK_MS);
+    run.abortTimer.unref?.();
+}
+function abortOverdue(t, run) {
+    if (run.settled)
+        return;
+    const waited = human(Date.now() - run.stopRequestedAt);
+    log(`abort overdue target=${t.key} id=${run.id} ack=${run.abortAck} alive=${t.alive} waited=${waited}`);
+    if (!t.alive) {
+        run.aborted = "会话失联";
+        settleLost(t, run);
+        return;
+    }
+    const body = run.abortAck
+        ? `终端已确认中断，但 ${waited} 后这一轮仍未结束，可能卡在某个命令或模型请求上。请到电脑上查看，必要时按 Esc 停止。`
+        : `终端 ${waited} 内没有确认中断，可能卡住了。请到电脑上查看，必要时按 Esc 停止。`;
+    void trackedPush(plainText({ head: "⚠️ 中断未生效", subject: t.label(), body, foot: "发送 `状态` 查看，或再发 `停止` 重试" }));
+}
+/** 扩展拒绝中断：终端已空闲或在跑别的轮次，说明这一轮的结束消息丢了；旧版扩展不带原因，只提示不收尾。 */
+function abortRejected(t, run, o) {
+    run.abortAck = false;
+    clearTimeout(run.abortTimer);
+    run.abortTimer = null;
+    const reason = String(o.reason || "");
+    log(`abort rejected target=${t.key} id=${run.id} reason=${reason || "-"} current=${o.currentRunId || "-"}`);
+    if (reason === "idle" || reason === "other-run") {
+        const cur = reason === "other-run" ? t.runById(String(o.currentRunId || "")) : null;
+        const ghosts = [...t.loops.values()].filter((r) => r !== run && r !== cur && !r.settled);
+        setTimeout(() => {
+            supersedeLoops(t, ghosts, cur);
+            if (run.settled)
+                return;
+            run.aborted = "结束未回传";
+            settleLost(t, run);
+        }, ABORT_REJECT_GRACE_MS).unref?.();
+        if (cur && cur !== run && !cur.settled && !cur.stopRequestedAt)
+            requestTuiAbort(t, cur);
+        return;
+    }
+    run.stopRequestedAt = 0;
+    const body = reason === "unregistered"
+        ? "终端正在处理的这一轮还没登记，暂时无法从手机中断。请稍后再发 `停止`，或到电脑上按 Esc。"
+        : "终端拒绝了中断（可能已空闲，或正在跑的不是这一轮）。请到电脑上查看。";
+    void trackedPush(plainText({ head: "⚠️ 中断未生效", subject: t.label(), body, foot: "发送 `状态` 查看" }));
 }
 const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact", "restart", "art"]);
 const NL_ALIASES = [
@@ -1941,6 +2051,18 @@ const UI_KINDS = new Set(["confirm", "select", "input", "editor", "question"]);
 // 提问工具（question / questionnaire）允许手机直接回文字作答：记录等待文字的请求。
 const WRITE_LABEL = "✏️ 自己写（直接回复文字）";
 const uiPending = new Map();
+// 未绑定的终端会话发来的弹窗：先不推手机，绑定到该会话时再推（计时从推送时开始）。
+const uiParked = new Map();
+const isBound = (t) => !!currentSessionId && t.sessionId === currentSessionId;
+function flushParkedUi(t) {
+    for (const [reqId, p] of [...uiParked]) {
+        if (p.t !== t)
+            continue;
+        uiParked.delete(reqId);
+        log(`bind → resend ui target=${t.key} kind=${p.req.kind}`);
+        openUiPrompt(t, p.req, p.reply);
+    }
+}
 const durLabel = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.max(1, Math.round(ms / 1000))} 秒`);
 // 弹窗内容放进代码块：避免 `$...$` 被企微渲染成公式、Markdown 符号被解释。
 function uiFence(text) {
@@ -2017,7 +2139,8 @@ function openUiPrompt(t, req, reply) {
         options.push(["取消", { cancelled: true }]);
         if (list.length > room)
             e.more = list.length - room;
-        const hint = [e.multi ? "可多选" : "", e.allowText ? "可直接回复文字" : "", e.more ? `另 ${e.more} 项请到电脑选` : "", `${limit}内未答将${after}`].filter(Boolean).join(" · ");
+        // 说明行首放会话名，多个会话同时提问时能分清；「可直接回复文字」已在选项里，不再占位。
+        const hint = [clipWidth(who, 14), e.multi ? "可多选" : "", e.more ? `另 ${e.more} 项请到电脑选` : "", `${limit}内未答将${after}`].filter(Boolean).join(" · ");
         // 卡片标题只放得下约 26 字：题目被截断时先发完整题目，避免只看到半句话就作答。
         // 有短标签（AUQ 的 header）时卡片标题改用「步骤 + 标签」，完整题目在前一条消息里。
         const long = Array.from(`❓ ${title}`).length > 26;
@@ -2078,6 +2201,9 @@ function settleUiPrompt(e, answer) {
     return true;
 }
 function dropUiPrompts(t, answer = null) {
+    for (const [reqId, p] of [...uiParked])
+        if (p.t === t)
+            uiParked.delete(reqId);
     for (const e of [...uiPending.values()])
         if (e.t === t)
             answer ? settleUiPrompt(e, answer) : closeUiPrompt(e);
@@ -2166,11 +2292,14 @@ async function statusCard() {
     const kind = kindOf(t);
     const tunnel = transport.connected ? [] : ["企微：断开"];
     if (t.busy) {
-        const r = t.run;
+        const r = pendingRun(t) || t.run;
+        const stopping = r.stopRequestedAt
+            ? `\n\n${human(Date.now() - r.stopRequestedAt)}前已请求中断，${r.abortAck ? "终端已确认，等待这一轮结束" : "等待终端确认"}。`
+            : "";
         return plainText({
             head: "⏳ 运行中",
             subject: t.label(),
-            body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。\n\n${info}`,
+            body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。${stopping}\n\n${info}`,
             foot: [`类型：${kind}`, ...tunnel, "发送 `停止` 停止"].join(" · "),
         });
     }
@@ -2265,6 +2394,7 @@ function buildDirCard(arg) {
 // ---- 会话产物：从会话 jsonl 的 write 调用增量提取，by session 维度 ----
 const ART_EXT = new Set([".html", ".htm", ".md", ".pdf", ".docx", ".xlsx", ".pptx", ".png", ".svg"]);
 const ART_LIST_MAX = VOTE_OPT_MAX;
+const ART_DIRECT_MAX = 3;
 const ART_SEND_MAX = 50 * 1024 * 1024;
 function artAllowed(p) {
     if (!ART_EXT.has(path.extname(p).toLowerCase()))
@@ -2356,6 +2486,8 @@ function buildArtCard(t) {
     const all = scanArtifacts(t);
     if (!all.length)
         return plainText({ head: "📎 暂无产物", subject: t.label(), body: "本会话还没有生成 HTML / 文档类文件。", foot: "支持：html md pdf docx xlsx pptx png svg" });
+    if (all.length <= ART_DIRECT_MAX)
+        return sendArtifacts(all);
     const rows = all.slice(0, ART_LIST_MAX);
     const options = rows.map((r) => ({
         id: registerPick({ act: "art", file: r.file }),
@@ -2723,11 +2855,19 @@ async function handleCommand(text, media = [], ack = { media: false }) {
         if (!t.busy)
             return plainText({ head: "🧊 无需中断", subject: t.label(), body: "当前空闲，没有在跑的任务" });
         if (t.kind === "tui") {
-            if (!t.run?.id)
+            const run = pendingRun(t);
+            if (!run || !t.loops.has(run.id))
                 return "当前轮次尚未注册，请稍后重试中断。";
-            t.inbox.push({ type: "abort", runId: t.run.id });
-            t.waiter?.();
-            return plainText({ head: "⏳ 已请求中断", subject: t.label(), body: "等待终端确认", foot: "发送 `状态` 查看" });
+            if (!t.alive)
+                return plainText({ head: "⚠️ 中断失败", subject: t.label(), body: "终端会话已失联，中断请求送不到。请到电脑上查看。", foot: "发送 `状态` 查看" });
+            const since = run.stopRequestedAt;
+            requestTuiAbort(t, run);
+            return plainText({
+                head: "⏳ 已请求中断",
+                subject: t.label(),
+                body: since ? `已重发中断请求，首次请求在 ${human(Date.now() - since)} 前，等待终端确认` : "等待终端确认",
+                foot: "发送 `状态` 查看",
+            });
         }
         const run = t.run;
         if (run)
@@ -2887,6 +3027,16 @@ async function handleHttp(req, res) {
         if (o.pid && [...targets.values()].some((x) => x.kind === "rpc" && x.proc?.pid === o.pid)) {
             return json(res, 400, { error: "refusing self-registration from a daemon-spawned rpc child" });
         }
+        let handedOff = false;
+        const bg = backgroundOf(o.sessionFile, o.sessionId);
+        if (bg) {
+            // 后台还在跑：终端先不注册，稍后重试；空闲则关掉后台，会话交给终端（手机绑定按 sessionId 随之转过来）。
+            if (bg.busy || bg.starting)
+                return json(res, 200, { ok: true, waiting: true, tunnel: transport.connected });
+            log(`hand off rpc ${bg.key} to TUI id=${String(o.sessionId).slice(0, 8)}`);
+            await bg.closeAndWait();
+            handedOff = true;
+        }
         let t = [...targets.values()].find((x) => x.kind === "tui" && x.sessionId === o.sessionId);
         if (!t) {
             t = new TuiTarget({
@@ -2930,7 +3080,7 @@ async function handleHttp(req, res) {
         if (currentSessionId && t.sessionId === currentSessionId)
             currentKey = t.key;
         await buildList();
-        return json(res, 200, { ok: true, key: t.key, tunnel: transport.connected });
+        return json(res, 200, { ok: true, key: t.key, tunnel: transport.connected, handedOff });
     }
     if (p === "/poll" && req.method === "GET") {
         const t = targets.get(url.searchParams.get("key"));
@@ -2981,6 +3131,7 @@ async function handleHttp(req, res) {
         if (!t.name)
             t.hint = promptHint(String(o.prompt || ""));
         if (!known) {
+            supersedeLoops(t, [...t.loops.values()], run);
             if (bound)
                 watchAsync(t, run);
             log(`loop open target=${t.key} id=${o.runId} ${o.local !== false ? "local" : "phone"}${bound ? "" : " unbound"} ${JSON.stringify(String(o.prompt || "").slice(0, 60))}`);
@@ -3009,8 +3160,14 @@ async function handleHttp(req, res) {
         const o = JSON.parse(await readBody(req));
         const t = targets.get(o.key);
         const run = t?.runById?.(o.runId);
-        if (run && !run.settled && o.accepted)
+        if (!run || run.settled)
+            return json(res, 200, { ok: true, stale: true });
+        if (o.accepted) {
             run.stopped = true;
+            run.abortAck = true;
+        }
+        else
+            abortRejected(t, run, o);
         return json(res, 200, { ok: true });
     }
     if (p === "/meta-ack" && req.method === "POST") {
@@ -3062,10 +3219,21 @@ async function handleHttp(req, res) {
         if (!UI_KINDS.has(o.kind) || typeof o.reqId !== "string" || !o.reqId || o.reqId.length > 80)
             return json(res, 400, { error: "bad ui request" });
         t.lastActivity = Date.now();
-        openUiPrompt(t, o, (answer) => {
+        const reply = (answer) => {
             t.inbox.push({ type: "ui_answer", reqId: o.reqId, ...answer });
             t.waiter?.();
-        });
+        };
+        if (!isBound(t)) {
+            // 编辑器挂起后电脑端也不会打开，交回扩展只在电脑上处理。
+            if (o.kind === "editor")
+                return json(res, 200, { ok: false, reason: "not bound" });
+            if (!uiPending.has(o.reqId) && !uiParked.has(o.reqId)) {
+                uiParked.set(o.reqId, { t, req: o, reply });
+                log(`ui parked (unbound) target=${t.key} kind=${o.kind}`);
+            }
+            return json(res, 200, { ok: true, parked: true });
+        }
+        openUiPrompt(t, o, reply);
         return json(res, 200, { ok: true });
     }
     if (p === "/ui-notice" && req.method === "POST") {
@@ -3079,6 +3247,10 @@ async function handleHttp(req, res) {
         if (!t || t.kind !== "tui" || !t.alive)
             return json(res, 410, { error: "unknown target" });
         const tool = clip(stripCtrl(String(o.tool || "")), 40);
+        if (!isBound(t)) {
+            log(`ui notice skipped (unbound) target=${t.key} tool=${JSON.stringify(tool)}`);
+            return json(res, 200, { ok: true, skipped: "not bound" });
+        }
         log(`ui notice target=${t.key} tool=${JSON.stringify(tool)}`);
         sendText(plainText({ head: "⌨️ 电脑端在等你操作", subject: t.label(), body: `${tool ? `\`${tool}\` ` : ""}打开了一个手机无法代答的界面，任务会一直等待。`, foot: "请到电脑上处理，或发送 `停止` 停止" }));
         return json(res, 200, { ok: true });
@@ -3089,6 +3261,8 @@ async function handleHttp(req, res) {
             o = JSON.parse(await readBody(req));
         }
         catch { }
+        if (uiParked.get(o.reqId)?.t.key === o.key)
+            uiParked.delete(o.reqId);
         const e = uiPending.get(o.reqId);
         if (e && e.t.key === o.key && closeUiPrompt(e))
             log(`ui answered on computer target=${e.t.key}`);

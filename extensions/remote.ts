@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
-import type {ExtensionAPI, ExtensionContext} from '@earendil-works/pi-coding-agent';
+import type {ExtensionAPI, ExtensionCommandContext, ExtensionContext} from '@earendil-works/pi-coding-agent';
 import {RUN_DIR, loadConfig, statusKeyAllowed} from '../daemon/config.mjs';
 type Json = Record<string, any>;
 type Runtime = {
@@ -11,6 +11,8 @@ type Runtime = {
   stopped: boolean; error: string; lastBeat: number;
   phone: boolean; uiWaits: Map<string, (answer: Json) => void>; uiReqs: Map<string, Json>;
   asking: Asking[]; tools: Map<string, string>;
+  /** 打开的是后台仍在运行的会话：等它结束后再交给终端。 */
+  waiting: boolean;
 };
 /** 正在执行的提问工具，供 ui.custom 识别：pi 示例 question / questionnaire，以及 AskUserQuestion 类（questions[].question）。 */
 type Asking = {toolCallId: string; kind: 'question' | 'questionnaire' | 'auq'; args: Json};
@@ -20,6 +22,33 @@ type DialogKind = 'confirm' | 'select' | 'input' | 'editor';
 const UI_PATCHED = Symbol.for('pi-remote-wecom.ui');
 const STATUS_PATCHED = Symbol.for('pi-remote-wecom.status');
 const UNKNOWN_UI_NOTICE_MS = Number(process.env.PI_REMOTE_UI_NOTICE_MS) || 30000;
+const HANDOFF_RETRY_MS = Number(process.env.PI_REMOTE_HANDOFF_RETRY_MS) || 2000;
+const HANDOFF_WIDGET = 'pi-remote-handoff';
+/** 隐藏子命令：不在 /remote 补全和菜单里，由扩展自己触发。 */
+export const RELOAD_COMMAND = 'remote reload';
+/** 与 vendor/tab-title 共用：等待期间会话文件仍由后台进程写入，标签模块不补起名。 */
+const HANDOFF_WAITING = Symbol.for('pi-remote-wecom.handoff-waiting');
+function setWaiting(r: {waiting: boolean; ctx: ExtensionContext}, on: boolean) {
+  r.waiting = on;
+  (globalThis as any)[HANDOFF_WAITING] = on;
+  r.ctx.ui.setWidget?.(HANDOFF_WIDGET, on ? [HANDOFF_TEXT.waiting] : undefined, {placement: 'aboveEditor'});
+}
+export const HANDOFF_TEXT = {
+  waiting: '手机端任务运行中，完成后自动刷新 · 现在查看：/remote reload',
+  blocked: '手机端任务未结束，消息暂未发出',
+  done: '手机端任务已完成，会话已更新至最新状态',
+  failed: '自动刷新失败，会话可能过时，请输入 /resume 重新打开',
+};
+/** 会话文件末尾有本进程没载入的条目：启动读文件之后、注册之前，后台进程又写了内容。 */
+function diskAhead(ctx: ExtensionContext) {
+  const file = ctx.sessionManager.getSessionFile();
+  if (!file) return false;
+  try {
+    const last = fs.readFileSync(file, 'utf8').trimEnd().split('\n').at(-1);
+    const id = last ? JSON.parse(last)?.id : undefined;
+    return !!id && id !== (ctx.sessionManager.getEntries() as any[]).at(-1)?.id;
+  } catch {return false;}
+}
 const isOptions = (x: unknown): x is QOption[] => Array.isArray(x) && x.every(o => o && typeof o.label === 'string');
 /** 按参数形状识别提问工具，不绑定工具名：question {question, options} / questionnaire {questions[]}。 */
 function askingKind(args: any): Asking['kind'] | null {
@@ -107,6 +136,8 @@ function renderStatus(label: string, tone: Tone) {
 }
 export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean} = {}) {
   let active: Runtime | undefined;
+  /** 自动刷新完成后在新会话里提示的文案；空则不提示。 */
+  let reloadNotice = '';
   // 其他扩展写进 footer 的状态项（每人不同）：从 ui.setStatus 截获，状态卡片按需上报。
   const extStatuses = new Map<string, string>();
   function footerInfo(r: Runtime) {
@@ -146,6 +177,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
       let remoteConfirm = 'ask-then-allow', remoteConfirmTimeoutMs = 600000;
       try {({remoteConfirm, remoteConfirmTimeoutMs} = loadConfig());} catch {}
       if (opts?.timeout > 0 && opts.timeout < remoteConfirmTimeoutMs) return; // 扩展自带更短超时，交给 Pi
+      if (sent.parked) return; // 会话未绑定：绑定后才推手机并开始计时，本地按发出时间兜底会提前代答
       fallback = setTimeout(() => resolve({local: false, value: kind === 'confirm' ? {confirmed: remoteConfirm !== 'ask'} : {cancelled: true}}), remoteConfirmTimeoutMs + 5000);
     });
     const phone = answer.then(value => ({local: false as const, value}));
@@ -326,6 +358,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     loseUi(r);
     // Cancel the long poll immediately. Use a separate finite request for unregister.
     r.cancel.abort(); r.ctx.ui.setStatus(r.statusKey, undefined); painted = null;
+    if (r.waiting) setWaiting(r, false);
     if (r.key) {
       try {await fetch(`http://127.0.0.1:${r.port}/unregister`, {
         method: 'POST', headers: {'content-type': 'application/json', 'x-pi-token': r.token},
@@ -340,7 +373,8 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const cfg = loadConfig();
     const r: Runtime = {ctx, cancelled: false, cancel: new AbortController(), key: null,
       token: '', port: cfg.localPort, statusKey: cfg.statusKey, runId: null, text: '',
-      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: [], tools: new Map()};
+      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: [], tools: new Map(),
+      waiting: false};
     active = r;
     extStatuses.clear(); // 新会话/重载时 Pi 已清空 footer 状态
     patchUi(ctx.ui);
@@ -360,8 +394,20 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
         if (!r.key) {
           const registered = await call(r, '/register', registration(r, origin));
           if (r.cancelled) break;
+          if (registered?.waiting) {
+            if (!r.waiting) setWaiting(r, true);
+            paintLink(r, registered.tunnel);
+            await delay(r, HANDOFF_RETRY_MS); continue;
+          }
           if (!registered?.key) {status(r, '服务未启动 · /remote restart', 'red'); await delay(r, 3000); continue;}
           r.key = registered.key;
+          if (r.waiting || (registered.handedOff && diskAhead(ctx))) {
+            // 画面是后台跑完之前的快照：重新载入会话文件。只有命令能切换会话，从这里触发内部命令。
+            reloadNotice = r.waiting ? HANDOFF_TEXT.done : '';
+            if (r.waiting) setWaiting(r, false);
+            try {pi.sendUserMessage(`/${RELOAD_COMMAND}`, {expandPromptTemplates: true});}
+            catch {ctx.ui.notify(HANDOFF_TEXT.failed, 'warning');}
+          }
           // /register already reports the WeCom link; paint now instead of waiting up to POLL_HOLD_MS for /poll.
           paintLink(r, registered.tunnel);
           // If daemon restarted during a run, restore the exact run identity, not a guessed new turn.
@@ -378,9 +424,11 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
         for (const msg of response.messages || []) {
           if (r.cancelled) break;
           if (msg.type === 'abort') {
-            const accepted = !!r.runId && msg.runId === r.runId && !ctx.isIdle();
+            const idle = ctx.isIdle();
+            const accepted = !!r.runId && msg.runId === r.runId && !idle;
             if (accepted) {r.stopped = true; ctx.abort();}
-            await call(r, '/abort-ack', {key: r.key, runId: msg.runId, accepted});
+            const reason = accepted ? '' : idle ? 'idle' : !r.runId ? 'unregistered' : 'other-run';
+            await call(r, '/abort-ack', {key: r.key, runId: msg.runId, accepted, reason, currentRunId: r.runId});
             continue;
           }
           if (msg.type === 'ui_answer') {
@@ -447,6 +495,24 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
       if (r.cancelled) finish();
     });
   }
+  /** 重新载入当前会话（接上手机端后台任务时由 /remote reload 调用）。 */
+  async function reload(ctx: ExtensionCommandContext) {
+    const notice = reloadNotice; reloadNotice = '';
+    const file = ctx.sessionManager.getSessionFile();
+    try {
+      if (!file) throw new Error('no session file');
+      // Pi 切换完会话后发自己的 info 通知，会替换掉同步发出的提示：延后一拍。
+      const res = await ctx.switchSession(file, {withSession: async fresh => {if (notice) setTimeout(() => fresh.ui.notify(notice, 'info'), 0);}});
+      if (res.cancelled) ctx.ui.notify(HANDOFF_TEXT.failed, 'warning');
+    } catch {
+      try {ctx.ui.notify(HANDOFF_TEXT.failed, 'warning');} catch {}
+    }
+  }
+  pi.on('input', (event, ctx) => {
+    if (!active?.waiting || event.source !== 'interactive') return;
+    ctx.ui.notify(HANDOFF_TEXT.blocked, 'warning');
+    return {action: 'handled'};
+  });
   pi.on('before_agent_start', async (event) => {
     const r = active; if (!r) return;
     r.runId = randomUUID(); r.text = ''; r.toolCalls = 0; r.stopped = false; r.error = ''; r.lastBeat = 0;
@@ -501,4 +567,5 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   pi.on('session_info_changed', refreshRegistration);
   pi.on('model_select', refreshRegistration);
   pi.on('session_shutdown', stop);
+  return {reload};
 }

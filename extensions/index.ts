@@ -55,7 +55,7 @@ export default function (pi: ExtensionAPI) {
       /(?:^|[/:])pi-(?:ghostty-)?tab-title(?:[@/#]|$)/.test(typeof p === 'string' ? p : p.source));
   } catch {}
   // Keep hook order: remote first, then naming. Legacy namers own their model settings, so assume they name sessions.
-  remote(pi, {autoName: () => legacyTitle || (cfg.tabTitleEnabled && namingEnabled())});
+  const {reload} = remote(pi, {autoName: () => legacyTitle || (cfg.tabTitleEnabled && namingEnabled())});
   if (cfg.tabTitleEnabled && !legacyTitle) tabTitle(pi);
   pi.registerCommand('remote', {
     description: '企微多会话遥控：状态与 setup / restart / stop / alias',
@@ -74,6 +74,7 @@ export default function (pi: ExtensionAPI) {
         action = choice.split(' ').at(-1)!;
       }
       if (action === 'alias') return aliasCommand(args.trim().slice('alias'.length), ctx);
+      if (action === 'reload') return reload(ctx);
       try {
         if (action === 'setup') {
           const running = await health();

@@ -50,6 +50,7 @@ test('TUI 扩展只中断指定轮次；重载取消旧轮询，不向新会话�
   await hooks.get('before_agent_start')({prompt:'任务'});
   const runId=calls.find(x=>x.endpoint==='/turn').body.runId;
   polls[0].reply([{type:'abort',runId:'old-run'}]);await until(()=>polls.length===2);assert.equal(aborts,0);
+  assert.deepEqual(calls.find(x=>x.endpoint==='/abort-ack').body,{key:calls.find(x=>x.endpoint==='/turn').body.key,runId:'old-run',accepted:false,reason:'other-run',currentRunId:runId});
   polls[1].reply([{type:'abort',runId}]);await until(()=>polls.length===3);assert.equal(aborts,1);
   assert.ok(calls.some(x=>x.endpoint==='/abort-ack'&&x.body.accepted));
   await hooks.get('message_end')({message:{role:'assistant',content:[{type:'text',text:'正在检查'}],stopReason:'toolUse'}});
