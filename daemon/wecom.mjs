@@ -420,7 +420,9 @@ export class WeComTransport {
       const files = [...this.pendingMedia, ...media];
       if (files.length > MAX_ATTACHMENTS) {await this.send(`一次最多处理 ${MAX_ATTACHMENTS} 个附件，请减少附件后重试。`); return;}
       const ack = {media: false};
-      const reply = await this.onMessage(text, files, ack);
+      // Quoted text is used only to route the reply to the quoted session, never forwarded to Pi.
+      const quote = body.quote?.msgtype === 'text' ? String(body.quote.text?.content || '') : '';
+      const reply = await this.onMessage(text, files, ack, {quote});
       if (ack.media) this.pendingMedia = [];
       else if (media.length) this.pendingMedia.push(...media.map(item => ({...item, at: now})));
       await this.send(reply);

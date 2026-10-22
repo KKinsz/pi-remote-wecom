@@ -355,6 +355,7 @@ class Run {
         this.abortTimer = null;
         this.local = false;
         this.watched = false;
+        this.muted = false;
         this.settled = false;
         this._waiters = [];
     }
@@ -424,7 +425,7 @@ class Target {
     runForTurn() {
         if (this.run && !this.run.settled) {
             if (this.run.local)
-                this.run.local = false;
+                this.run.local = this.run.muted = false;
             return { run: this.run, reused: true };
         }
         this.run = new Run();
@@ -438,6 +439,8 @@ class Target {
         const run = this.run && !this.run.settled && !this.loops.has(this.run.id) ? this.run : new Run();
         run.id = id;
         run.local = local;
+        if (!local)
+            run.muted = false;
         this.loops.set(id, run);
         this.run = run;
         if (this.loops.size > 8) {
@@ -1063,6 +1066,8 @@ const liveRows = (rows) => rows.filter((t) => t.kind !== "history");
 const histRows = (rows) => rows.filter((t) => t.kind === "history");
 let currentKey = null;
 let currentSessionId = "";
+// 「取关」后电脑上发起的轮次不推送；只在内存，重启后恢复推送，宁可多推不漏推。
+let muted = false;
 function loadCurrent() {
     try {
         currentSessionId = fs.readFileSync(CURRENT_FILE, "utf8").trim();
@@ -1071,15 +1076,18 @@ function loadCurrent() {
         currentSessionId = "";
     }
 }
+/** 手机上的切换动作；返回补推的待答问题数。 */
 function bindCurrent(t) {
     currentKey = t?.key || null;
+    let flushed = 0;
     if (t) {
+        muted = false;
         watchInflight(t);
-        flushParkedUi(t);
+        flushed = flushParkedUi(t);
     }
     const sid = t?.sessionId || "";
     if (sid === currentSessionId)
-        return;
+        return flushed;
     currentSessionId = sid;
     try {
         if (sid)
@@ -1090,13 +1098,18 @@ function bindCurrent(t) {
     catch (e) {
         log(`写 .current 失败：${e?.message || e}`);
     }
+    return flushed;
 }
-function watchInflight(t) {
+function inflightRuns(t) {
     const runs = new Set(t.loops ? [...t.loops.values()] : []);
     if (t.run)
         runs.add(t.run);
-    for (const r of runs) {
-        if (r.settled || r.watched)
+    return [...runs].filter((r) => !r.settled);
+}
+function watchInflight(t) {
+    for (const r of inflightRuns(t)) {
+        r.muted = false;
+        if (r.watched)
             continue;
         watchAsync(t, r);
         log(`bind → watch inflight target=${t.key} id=${r.id} elapsed=${human(Date.now() - r.startedAt)}`);
@@ -1520,6 +1533,7 @@ function trackLocalTurn(t, prompt) {
         t.hint = promptHint(prompt || "");
     const run = new Run();
     run.local = true;
+    run.muted = muted;
     t.run = run;
     t.lastActivity = Date.now();
     watchAsync(t, run);
@@ -1539,7 +1553,7 @@ function watchAsync(t, run) {
     const prog = setInterval(() => {
         if (run.settled || sent >= SILENCE_STEPS_MS.length)
             return clearInterval(prog);
-        if (run.stopped || run.stopRequestedAt)
+        if (run.stopped || run.stopRequestedAt || run.muted)
             return;
         const silent = Date.now() - run.lastOutputAt;
         if (silent < SILENCE_STEPS_MS[sent])
@@ -1557,6 +1571,10 @@ function watchAsync(t, run) {
         clearInterval(prog);
         if (run.superseded)
             return;
+        if (run.muted) {
+            log(`async muted target=${t.key} dur=${human((run.endedAt || Date.now()) - run.startedAt)}（已取关，不推送）`);
+            return;
+        }
         // 用户主动「停止」时，中止引发的 stopReason=error 不是真实失败，否则会在回执后再多推一条「任务失败」。
         if (run.stopByCmd && !run.aborted)
             run.error = "";
@@ -1655,7 +1673,7 @@ function abortRejected(t, run, o) {
         : "终端拒绝了中断（可能已空闲，或正在跑的不是这一轮）。请到电脑上查看。";
     void trackedPush(plainText({ head: "⚠️ 中断未生效", subject: t.label(), body, foot: "发送 `状态` 查看" }));
 }
-const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact", "restart", "art"]);
+const COMMANDS = new Set(["ls", "h", "n", "nb", "stop", "status", "help", "model", "cd", "think", "compact", "restart", "art", "remote", "mute"]);
 const NL_ALIASES = [
     ["帮助", "help", false],
     ["活跃会话", "ls", false],
@@ -1683,6 +1701,10 @@ const NL_ALIASES = [
     ["重启", "restart", true],
     ["产物", "art", false],
     ["查看产物", "art", false],
+    ["关注", "remote", false],
+    ["取消关注", "mute", false],
+    ["取关", "mute", false],
+    ["静音", "mute", false],
 ].sort((a, b) => b[0].length - a[0].length);
 function parseNlAlias(body) {
     for (const [word, cmd, args] of NL_ALIASES) {
@@ -1732,6 +1754,7 @@ const helpText = () => [
     "| h | 历史会话 |",
     "| model | 模型 |",
     "| think | 思考强度 |",
+    "| remote / mute | 关注 / 取关 |",
     "| cd | 目录 |",
     "| art | 产物 |",
     "| compact | 压缩 |",
@@ -2055,13 +2078,89 @@ const uiPending = new Map();
 const uiParked = new Map();
 const isBound = (t) => !!currentSessionId && t.sessionId === currentSessionId;
 function flushParkedUi(t) {
+    let n = 0;
     for (const [reqId, p] of [...uiParked]) {
         if (p.t !== t)
             continue;
         uiParked.delete(reqId);
         log(`bind → resend ui target=${t.key} kind=${p.req.kind}`);
         openUiPrompt(t, p.req, p.reply);
+        n++;
     }
+    return n;
+}
+const hasParkedUi = (t) => [...uiParked.values()].some((p) => p.t === t);
+function remindParkedUi(t) {
+    sendText(plainText({ head: "❓ 等你回答", subject: t.label(), body: "这个会话在等你作答，任务会一直等待。", foot: "引用这条消息回复即可切过去作答" }));
+}
+/** 「关注」：给所有终端会话里在跑的任务挂上回传，并解除取关。 */
+function remoteAll() {
+    muted = false;
+    const rows = [];
+    for (const t of targets.values()) {
+        if (t.kind !== "tui" || !t.alive)
+            continue;
+        const runs = inflightRuns(t);
+        if (!runs.length)
+            continue;
+        for (const r of runs) {
+            r.muted = false;
+            if (!r.watched) {
+                watchAsync(t, r);
+                log(`remote → watch inflight target=${t.key} id=${r.id} elapsed=${human(Date.now() - r.startedAt)}`);
+            }
+        }
+        rows.push(t);
+    }
+    const cur = currentTarget();
+    if (!rows.length) {
+        return plainText({ head: "📌 关注", body: "没有运行中的终端会话。", foot: cur ? `当前会话：${cur.label()}` : "发送 `活跃会话` 选择" });
+    }
+    const lines = rows.map((t) => {
+        const r = pendingRun(t);
+        const bits = [t.label(), `已运行 ${human(Date.now() - (r?.startedAt || Date.now()))}`];
+        if (hasParkedUi(t))
+            bits.push("等你回答");
+        if (t === cur)
+            bits.push("当前");
+        return `- ${bits.join(" · ")}`;
+    });
+    return plainText({
+        head: `📌 已关注 ${rows.length} 个运行中会话`,
+        body: lines.join("\n"),
+        foot: [cur ? `当前会话：${cur.label()}` : "", "引用消息，回复会发给相应会话"].filter(Boolean).join(" · "),
+    });
+}
+/** 「取关」：电脑上发起的轮次（含在跑的）不再推送，手机发起的不受影响。 */
+function muteAll() {
+    muted = true;
+    let n = 0;
+    for (const t of targets.values()) {
+        for (const r of inflightRuns(t)) {
+            if (r.local && r.watched && !r.muted) {
+                r.muted = true;
+                n++;
+            }
+        }
+    }
+    log(`mute runs=${n}`);
+    return plainText({
+        head: "🔕 已取关",
+        body: `电脑上发起的任务不再推送${n ? `，运行中的 ${n} 个也不再回传` : ""}。手机发起的任务照常推送。`,
+        foot: "发送 `关注` 恢复",
+    });
+}
+/** 引用了一条「图标 状态 · 会话名」的推送：按会话名找到唯一的存活会话，找不到或重名就按当前会话处理。 */
+function quotedTarget(quote) {
+    const line = String(quote || "").split("\n", 1)[0].trim();
+    const m = /^\S+ [^·]+? · (.+)$/.exec(line);
+    if (!m)
+        return null;
+    const name = m[1].trim();
+    const hits = [...targets.values()].filter((t) => t.kind !== "history" && (t.kind !== "tui" || t.alive) && clipWidth(t.label(), 32) === name);
+    if (hits.length > 1)
+        log(`引用的会话名对应 ${hits.length} 个会话，按当前会话处理`);
+    return hits.length === 1 ? hits[0] : null;
 }
 const durLabel = (ms) => (ms >= 60000 ? `${Math.round(ms / 60000)} 分钟` : `${Math.max(1, Math.round(ms / 1000))} 秒`);
 // 弹窗内容放进代码块：避免 `$...$` 被企微渲染成公式、Markdown 符号被解释。
@@ -2300,16 +2399,17 @@ async function statusCard() {
             head: "⏳ 运行中",
             subject: t.label(),
             body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。${stopping}\n\n${info}`,
-            foot: [`类型：${kind}`, ...tunnel, "发送 `停止` 停止"].join(" · "),
+            foot: [`类型：${kind}`, ...tunnel, ...mutedFoot(), "发送 `停止` 停止"].join(" · "),
         });
     }
     return plainText({
         head: "🧊 空闲",
         subject: t.label(),
         body: `等你发消息，上次活动 ${ago(t.lastActivity)}。\n\n${info}`,
-        foot: [`类型：${kind}`, ...tunnel].join(" · "),
+        foot: [`类型：${kind}`, ...tunnel, ...mutedFoot()].join(" · "),
     });
 }
+const mutedFoot = () => (muted ? ["已取关：电脑任务不推送"] : []);
 // ---- 默认目录：只影响之后新建的会话（`创建会话` 不带目录时），已有会话不动 ----
 const DEFAULT_DIR_FILE = path.join(DIR, ".default-dir");
 function defaultDir() {
@@ -2772,7 +2872,14 @@ async function handleCardCallback({ taskId, optionId, optionIds = [] }) {
     const rows = await buildList({ find: pick.find || "", includeSub: !!pick.includeSub });
     return applyPick(pick, rows);
 }
-async function handleCommand(text, media = [], ack = { media: false }) {
+async function handleCommand(text, media = [], ack = { media: false }, { quote = "" } = {}) {
+    const via = quotedTarget(quote);
+    if (via && via !== currentTarget()) {
+        log(`引用回复 → ${via.key} name=${JSON.stringify(via.label())}`);
+        if (bindCurrent(via)) {
+            return plainText({ head: "📥 已切换", subject: via.label(), body: "待答的问题已推送，请在卡片上作答。这条消息没有投递，需要的话请重发。" });
+        }
+    }
     const raw = text.trim();
     const parsed = parseCmd(raw);
     if (!parsed && !media.length) {
@@ -2813,11 +2920,15 @@ async function handleCommand(text, media = [], ack = { media: false }) {
     const { cmd, rest } = parsed;
     if (parsed.alias || parsed.bare)
         log(`${parsed.alias ? `中文说法 ${parsed.alias}` : `免前缀 ${cmd}`} → ${cmd}${rest ? ` ${JSON.stringify(rest.slice(0, 60))}` : ""}`);
-    if (media.length && ["ls", "h", "status", "help", "stop", "model", "cd", "think", "compact", "art"].includes(cmd)) {
+    if (media.length && ["ls", "h", "status", "help", "stop", "model", "cd", "think", "compact", "art", "remote", "mute"].includes(cmd)) {
         log(`命令 ${cmd} 不投递内容，${media.length} 个附件未受理（mediaAccepted=false）`);
     }
     if (cmd === "help")
         return helpText();
+    if (cmd === "remote")
+        return remoteAll();
+    if (cmd === "mute")
+        return muteAll();
     if (cmd === "ls")
         return buildLsCard(await buildList());
     if (cmd === "h") {
@@ -3132,8 +3243,10 @@ async function handleHttp(req, res) {
             t.hint = promptHint(String(o.prompt || ""));
         if (!known) {
             supersedeLoops(t, [...t.loops.values()], run);
-            if (bound)
+            if (bound) {
+                run.muted = muted && run.local;
                 watchAsync(t, run);
+            }
             log(`loop open target=${t.key} id=${o.runId} ${o.local !== false ? "local" : "phone"}${bound ? "" : " unbound"} ${JSON.stringify(String(o.prompt || "").slice(0, 60))}`);
         }
         return json(res, 200, { ok: true, tracked: !!bound });
@@ -3228,8 +3341,12 @@ async function handleHttp(req, res) {
             if (o.kind === "editor")
                 return json(res, 200, { ok: false, reason: "not bound" });
             if (!uiPending.has(o.reqId) && !uiParked.has(o.reqId)) {
+                const first = !hasParkedUi(t);
                 uiParked.set(o.reqId, { t, req: o, reply });
                 log(`ui parked (unbound) target=${t.key} kind=${o.kind}`);
+                const run = pendingRun(t);
+                if (first && run?.watched && !run.muted)
+                    remindParkedUi(t);
             }
             return json(res, 200, { ok: true, parked: true });
         }
@@ -3349,7 +3466,7 @@ async function handleHttp(req, res) {
         try {
             const body = JSON.parse(await readBody(req));
             const ack = { media: false };
-            const reply = await handleCommand(String(body.text || ""), [], ack);
+            const reply = await handleCommand(String(body.text || ""), [], ack, { quote: String(body.quote || "") });
             return json(res, 200, { ok: true, reply });
         }
         catch {

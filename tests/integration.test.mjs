@@ -419,6 +419,53 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.match(JSON.stringify((await api('/command',{text:'cd ~'})).reply),/切换目录/);
   assert.match((await api('/command',{text:'切换目录'})).reply.card.options[0].text,/← 当前/);
   assert.match((await api('/command',{text:'目录'})).reply.card.task_id,/^task_cwd_/);
+  // 关注 / 取关 / 引用回复：关注只接管在跑的终端任务；取关后电脑发起的不推、手机发起的照推；引用推送回复发给那个会话。
+  const pushed=(s)=>sent.some(x=>x.markdown?.content.includes(s));
+  await api('/register',{mode:'tui',sessionId:'A',sessionName:'会话A',cwd:dir});
+  await api('/register',{mode:'tui',sessionId:'B',sessionName:'会话B',cwd:dir});
+  assert.ok(![a.key,b.key].includes((await api('/health')).current));
+  assert.equal((await api('/turn',{key:a.key,runId:'w-A1',local:true,prompt:'A桌面任务'})).tracked,false);
+  assert.equal((await api('/turn',{key:b.key,runId:'w-B1',local:true,prompt:'B桌面任务'})).tracked,false);
+  const watched=(await api('/command',{text:'关注'})).reply;
+  assert.match(watched,/已关注 2 个运行中会话/); assert.match(watched,/- 会话A · 已运行/); assert.match(watched,/- 会话B · 已运行/);
+  assert.match((await api('/command',{text:'remote'})).reply,/已关注 2 个/);
+  assert.equal((await api('/ui-request',{key:b.key,reqId:'w-ui',kind:'confirm',title:'确认B'})).parked,true);
+  await api('/ui-request',{key:b.key,reqId:'w-ui-2',kind:'confirm',title:'确认B2'});
+  await until(()=>pushed('等你回答 · 会话B'));
+  assert.equal(sent.filter(x=>x.markdown?.content.includes('等你回答 · 会话B')).length,1);
+  assert.ok(!sent.some(x=>x.template_card?.main_title?.title?.includes('确认B')));
+  await api('/result',{key:a.key,runId:'w-A1',text:'A关注后的结果'});
+  await until(()=>pushed('A关注后的结果'));
+  // Quoted text arrives rendered (no ###): the first line names the session.
+  const viaQuote=api('/command',{text:'引用回A',quote:'🏁 任务完成 · 会话A\n\nA关注后的结果'});
+  const quoted=await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.text==='引用回A'));
+  assert.ok(quoted); assert.equal((await api('/health')).current,a.key);
+  await api('/turn',{key:a.key,runId:'w-A2',local:false,prompt:'引用回A'}); await viaQuote;
+  await api('/result',{key:a.key,runId:'w-A2',text:'A2引用结果'});
+  await until(()=>pushed('A2引用结果'));
+  // Unknown or ambiguous quotes keep the current session.
+  await api('/command',{text:'help',quote:'🏁 任务完成 · 不存在的会话'});
+  assert.equal((await api('/health')).current,a.key);
+  // Quoting the reminder switches and pushes the parked prompt; the filler text is not delivered.
+  const sw=(await api('/command',{text:'看看',quote:'❓ 等你回答 · 会话B\n\n这个会话在等你作答'})).reply;
+  assert.match(sw,/已切换 · 会话B[\s\S]*没有投递/); assert.equal((await api('/health')).current,b.key);
+  await until(()=>sent.some(x=>x.template_card?.main_title?.title?.includes('确认B')));
+  await api('/ui-done',{key:b.key,reqId:'w-ui'}); await api('/ui-done',{key:b.key,reqId:'w-ui-2'});
+  const muteReply=(await api('/command',{text:'取关'})).reply;
+  assert.match(muteReply,/已取关[\s\S]*运行中的 1 个也不再回传[\s\S]*手机发起的任务照常推送/);
+  for (const word of ['静音','取消关注','mute']) assert.match((await api('/command',{text:word})).reply,/已取关/);
+  await api('/result',{key:b.key,runId:'w-B1',text:'B1取关后的结果'});
+  await api('/turn',{key:b.key,runId:'w-B2',local:true,prompt:'B取关后桌面任务'});
+  await api('/result',{key:b.key,runId:'w-B2',text:'B2取关后的结果'});
+  await api('/turn',{key:b.key,runId:'w-B3',local:false,prompt:'手机任务'});
+  await api('/result',{key:b.key,runId:'w-B3',text:'B3手机结果'});
+  await until(()=>pushed('B3手机结果'));
+  assert.ok(!pushed('B1取关后的结果')); assert.ok(!pushed('B2取关后的结果'));
+  assert.match((await api('/command',{text:'关注'})).reply,/没有运行中的终端会话/);
+  await api('/turn',{key:b.key,runId:'w-B4',local:true,prompt:'B恢复后桌面任务'});
+  await api('/result',{key:b.key,runId:'w-B4',text:'B4恢复后的结果'});
+  await until(()=>pushed('B4恢复后的结果'));
+  assert.match((await api('/command',{text:'帮助'})).reply,/\| remote \/ mute \| 关注 \/ 取关 \|/);
   const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,8); // 2 + 2 alias + 3 confirm + 1 default-dir sessions
   assert.equal(all.targets.filter(x=>x.kind==='tui').length,2);
   assert.equal(errors,'');

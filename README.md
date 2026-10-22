@@ -48,7 +48,7 @@ The UI and bot replies are currently primarily in Chinese. English command alias
 
 ## Commands
 
-On your phone, select a session and send a message to continue it.
+On your phone, select a session and send a message to continue it. Quote a pushed result to reply to the session it came from; that session becomes the current one.
 
 | Command | Action |
 |---|---|
@@ -62,6 +62,7 @@ On your phone, select a session and send a message to continue it.
 | `cd [alias]` | Pick the default directory for new sessions from your directory aliases (default `~`); existing sessions are unaffected |
 | `restart [force]` | Restart the remote-control daemon (loads new code); refused while a task is running unless `force` is given |
 | `status` | Show the current session's status: directory and branch, model and thinking level, context, cost, and statuses set by other extensions via `setStatus`, optionally limited by the `statusKeys` allowlist in config (built-in footer layout; no footer extension required) |
+| `remote` / `mute` | Leaving the computer: `remote` (`关注`) watches every running terminal task and pushes each result when it finishes. Back at the computer: `mute` (`取关`, `取消关注`, `静音`) stops pushing tasks started on the computer, including running ones; phone-initiated tasks are still pushed. Mute lasts until `remote`, switching sessions on the phone, or a daemon restart |
 | `stop` | Interrupt the current task |
 | `help` | Show all commands |
 
