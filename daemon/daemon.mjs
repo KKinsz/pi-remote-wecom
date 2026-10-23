@@ -1080,8 +1080,17 @@ function loadCurrent() {
         currentSessionId = "";
     }
 }
+// 上次发消息或切换会话以来推送过的会话，最近的在前；不设有效期。
+let pushedKeys = [];
+const notePush = (t) => { pushedKeys = [t.key, ...pushedKeys.filter((k) => k !== t.key)]; };
+const liveTarget = (t) => !!t && t.kind !== "history" && (t.kind === "tui" ? t.alive : !t.closed);
+/** 推送过的非当前会话：此时不引用的普通消息容易发错，需先确认发给谁。 */
+function pushedOthers(cur) {
+    return pushedKeys.map((k) => targets.get(k)).filter((t) => liveTarget(t) && t !== cur);
+}
 /** 手机上的切换动作；返回补推的待答问题数。 */
 function bindCurrent(t) {
+    pushedKeys = [];
     currentKey = t?.key || null;
     let flushed = 0;
     if (t) {
@@ -1489,6 +1498,7 @@ function fmtNotDelivered(t, error) {
     });
 }
 async function deliverAndWait(t, text, ack) {
+    pushedKeys = [];
     t.lastActivity = Date.now();
     if (!t.name)
         t.hint = promptHint(text);
@@ -1565,6 +1575,7 @@ function watchAsync(t, run) {
         while (sent < RUN_PING_MS.length && ran >= RUN_PING_MS[sent])
             sent++;
         const body = `已运行 ${human(ran)}，仍在运行中。` + (run.tool ? `\n\n当前动作：${toolLabel(run.tool)}` : "");
+        notePush(t);
         sendText(plainText({ head: "⏳ 运行中", subject: t.label(), body, foot: "发送 `状态` 查看详情，或 `停止` 停止" }));
     }, Math.min(30000, RUN_PING_MS[0] || 30000));
     run.wait().then(async () => {
@@ -1592,6 +1603,7 @@ function watchAsync(t, run) {
         const shaOf = typeof msg === "string" ? msg : msg.text;
         log(`async ${kind} sha=${sha8(shaOf)} target=${t.key} dur=${human((run.endedAt || Date.now()) - run.startedAt)}` +
             (typeof msg === "string" ? "" : " +md"));
+        notePush(t);
         await trackedPush(msg);
     });
 }
@@ -1614,8 +1626,10 @@ function supersedeLoops(t, runs, by) {
 function settleLost(t, run) {
     run.settle();
     t.noteSettled?.(run);
-    if (!run.watched)
+    if (!run.watched) {
+        notePush(t);
         void trackedPush(fmtAborted(t, run));
+    }
 }
 /** 终端会话的中断经轮询送达：重发不重置首次请求时间，也不推迟已在计时的提醒。 */
 function requestTuiAbort(t, run) {
@@ -2090,6 +2104,7 @@ function flushParkedUi(t) {
 }
 const hasParkedUi = (t) => [...uiParked.values()].some((p) => p.t === t);
 function remindParkedUi(t) {
+    notePush(t);
     sendText(plainText({ head: "❓ 等你回答", subject: t.label(), body: "这个会话在等你作答，任务会一直等待。", foot: "引用这条消息回复即可切过去作答" }));
 }
 /** 「关注」：给所有终端会话里在跑的任务挂上回传，并解除取关。 */
@@ -2860,6 +2875,13 @@ async function handleCardCallback({ taskId, optionId, optionIds = [] }) {
             return "这张卡片已经提交过。";
         return handleUiPick(pick, (optionIds.length ? optionIds : [optionId]).map((id) => cardPicks.get(id)).filter((x) => x?.act === "ui" && x.taskId === taskId));
     }
+    if (pick?.act === "route") {
+        if (pick.taskId !== taskId)
+            return "这张卡片已失效，消息未投递，请重发。";
+        if (consumeTask(taskId))
+            return "这张卡片已经提交过。";
+        return handleRoutePick(pick);
+    }
     const again = PICK_AGAIN[pick?.act];
     if (!pick || pick.taskId !== taskId || Date.now() - pick.at > CARD_TTL_MS) {
         return again ? `这张${again[0]}卡片已失效，请发送 \`${again[1]}\` 重新选择。` : "这张会话卡片已失效，请发送 `活跃会话` 或 `历史会话` 重新选择。";
@@ -2874,6 +2896,40 @@ async function handleCardCallback({ taskId, optionId, optionIds = [] }) {
         return handleDirPick(pick);
     const rows = await buildList({ find: pick.find || "", includeSub: !!pick.includeSub });
     return applyPick(pick, rows);
+}
+/** 暂存这条消息，用卡片问清发给当前会话还是刚推送的会话。 */
+function routeCard(cur, others, raw, media, ack) {
+    const held = { raw, media };
+    const opt = (t, tag) => ({ id: registerPick({ act: "route", targetKey: t.key, sessionId: t.sessionId, held }), text: clip(tag ? `${t.label()} ← ${tag}` : t.label(), 60) });
+    const content = [raw ? clipWidth(raw, 40) : "", media.length ? `（${media.length} 个附件）` : ""].join("");
+    const card = {
+        card_type: "vote_interaction",
+        title: "✉️ 发给哪个会话？",
+        desc: `消息内容：${content}`,
+        options: [opt(cur, "当前"), ...others.slice(0, VOTE_OPT_MAX - 1).map((t, i) => opt(t, i ? "" : "刚推送"))],
+        mode: 0,
+        submit_text: "发送",
+        task_id: taskId("route"),
+    };
+    if (media.length)
+        ack.media = true;
+    log(`推送过的是 ${others.map((t) => t.key).join(",")}，当前是 ${cur.key}：暂存消息，待选择`);
+    return cardBlock(card, "**消息未投递，请选择会话**", () => plainText({
+        head: "✉️ 消息未投递",
+        body: `刚收到「${others.map((t) => clipWidth(t.label(), 20)).join("」「")}」的推送，当前会话是「${clipWidth(cur.label(), 20)}」。`,
+        foot: "引用推送重发，或发送 `活跃会话` 切换后重发",
+    }));
+}
+async function handleRoutePick(pick) {
+    const t = [targets.get(pick.targetKey), ...[...targets.values()].filter((x) => pick.sessionId && x.sessionId === pick.sessionId)].find(liveTarget);
+    if (!t)
+        return plainText({ head: "⚠️ 消息未投递", body: "所选会话已关闭，请重发。", foot: "发送 `活跃会话` 重新选择" });
+    if (t !== currentTarget()) {
+        log(`选择投递 → 切换到 ${t.key}`);
+        if (bindCurrent(t))
+            return plainText({ head: "📥 已切换", subject: t.label(), body: "待答的问题已推送，请在卡片上作答。这条消息没有投递，需要的话请重发。" });
+    }
+    return deliverWithMedia(t, pick.held.raw, pick.held.media, null);
 }
 async function handleCommand(text, media = [], ack = { media: false }, { quote = "" } = {}) {
     const via = quotedTarget(quote);
@@ -2918,6 +2974,9 @@ async function handleCommand(text, media = [], ack = { media: false }, { quote =
             log(`未绑定会话，退回选择卡（活跃 ${live.length} 个），原文未投递`);
             return cardBlock(card, "**消息未投递，请先选择会话**", () => renderList(live, rows, "消息未投递"));
         }
+        const others = via ? [] : pushedOthers(t);
+        if (others.length)
+            return routeCard(t, others, raw, media, ack);
         return deliverWithMedia(t, raw, media, ack);
     }
     const { cmd, rest } = parsed;
@@ -3378,6 +3437,7 @@ async function handleHttp(req, res) {
             return json(res, 200, { ok: true, skipped: "not bound" });
         }
         log(`ui notice target=${t.key} tool=${JSON.stringify(tool)}`);
+        notePush(t);
         sendText(plainText({ head: "⌨️ 电脑端在等你操作", subject: t.label(), body: `${tool ? `\`${tool}\` ` : ""}打开了一个手机无法代答的界面，任务会一直等待。`, foot: "请到电脑上处理，或发送 `停止` 停止" }));
         return json(res, 200, { ok: true });
     }

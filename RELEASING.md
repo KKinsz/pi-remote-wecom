@@ -4,7 +4,7 @@ This repository can be distributed as a Pi package through Git or npm. Follow th
 
 ## One checkout, two remotes
 
-Local `main` tracks `origin/main` (CNB) and is the development base: `git switch main && git pull --ff-only`, branch from it, and fast-forward it after merging. `codex/public-release` is the only local branch for GitHub history; never merge it into `main` or the reverse.
+Local `main` tracks `origin/main` (CNB) and is the development base: `git switch main && git pull --ff-only`, branch from it, and fast-forward it after merging. `public-release` is the only local branch for GitHub history; never merge it into `main` or the reverse.
 
 Maintain one codebase in one local checkout. Keep `origin` pointing to the existing CNB repository and add `github` for the public repository. Do not change the existing origin URL or configure multiple push URLs on it: each destination should be explicit.
 
@@ -39,13 +39,13 @@ npm pack --dry-run
 
 ## Prepare subsequent public snapshots
 
-`codex/public-release` is a distribution branch, not a second development branch. Fixes belong in the development branch, including fixes received from community PRs. Rebuild the public snapshot from the reviewed development commit; do not merge that commit into the public branch.
+`public-release` is a distribution branch, not a second development branch. Fixes belong in the development branch, including fixes received from community PRs. Rebuild the public snapshot from the reviewed development commit; do not merge that commit into the public branch.
 
 For a committed, reviewed source revision, the following local-only example appends its tree to the public history without copying its ancestry. Set `SOURCE_COMMIT` to that exact commit and use the maintainer's confirmed public identity shown below. Run release checks against that source before preparing the snapshot.
 
 ```sh
 source_commit=SOURCE_COMMIT
-public_ref=refs/heads/codex/public-release
+public_ref=refs/heads/public-release
 previous_public=$(git rev-parse "$public_ref")
 source_tree=$(git rev-parse "$source_commit^{tree}")
 new_public=$(GIT_AUTHOR_NAME=KKinsz \
@@ -63,7 +63,7 @@ The final comparison must be empty. Use the source and public commit IDs as the 
 
 Once the repository and release are approved for public distribution:
 
-1. Promote the development revision to CNB through its review process. Publish only `codex/public-release` to GitHub (for example, `git push github codex/public-release:main`) and wait for CI. Confirm its source tree matches the approved CNB revision; the commit IDs differ by design.
+1. Promote the development revision to CNB through its review process. Publish only `public-release` to GitHub (for example, `git push github public-release:main`) and wait for CI. Confirm its source tree matches the approved CNB revision; the commit IDs differ by design.
 2. Create destination-specific version tags and releases with matching versions, changelog, and known limitations. Public tags must point into the public history. Do not reuse an internal tag for the public push, because that would publish its ancestry.
 3. Authenticate to npm using your own account, confirm the package name and registry, then run `npm publish --access public`. The package's `prepublishOnly` hook reruns validation; do not bypass it with `--ignore-scripts`.
 4. Verify installation from the published Git tag and npm version using an isolated Pi configuration. Only then add the npm installation command to both READMEs and announce the release to the Pi community.

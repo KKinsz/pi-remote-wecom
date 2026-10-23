@@ -48,7 +48,7 @@ The UI and bot replies are currently primarily in Chinese. English command alias
 
 ## Commands
 
-On your phone, select a session and send a message to continue it. Quote a pushed result to reply to the session it came from; that session becomes the current one.
+On your phone, select a session and send a message to continue it. Quote a pushed result to reply to the session it came from; that session becomes the current one. If other sessions have pushed since your last message, an unquoted message is held and a card asks whether to send it to the current session or one of those that pushed; your pick delivers it without resending.
 
 | Command | Action |
 |---|---|

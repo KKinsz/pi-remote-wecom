@@ -162,6 +162,15 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal((await api('/result',{key:a.key,runId:'run-A',text:'重复错误内容'})).stale,true);
   message('给A的任务',{id:msgId}); await delay(100);
   assert.ok(!sent.some(x=>x.markdown?.content.includes('重复错误内容')));
+  // A pushed while B is current: the next plain message waits for a pick; picking the current one delivers there.
+  const holdB=(await api('/command',{text:'还是发B'})).reply.card;
+  assert.deepEqual(holdB.options.map(o=>o.text),['会话B ← 当前','会话A ← 刚推送']);
+  socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:holdB.task_id,selected_items:{selected_item:[{question_key:holdB.task_id,option_ids:{option_id:[holdB.options[0].id]}}]}}}}}));
+  assert.ok(await until(async()=>(await api(`/poll?key=${b.key}`)).messages?.find(m=>m.text==='还是发B')));
+  assert.equal((await api('/health')).current,b.key);
+  await api('/turn',{key:b.key,runId:'run-B0',local:false,prompt:'还是发B'});
+  await api('/result',{key:b.key,runId:'run-B0',text:'B0结果'});
+  await until(()=>sent.some(x=>x.markdown?.content.includes('B0结果')));
   // B stop request is a control message addressed to its exact current loop.
   await api('/turn',{key:b.key,runId:'run-B',local:true,prompt:'B本地任务'});
   const stop=await api('/command',{text:'停止'}); assert.match(stop.reply,/已请求中断/);
@@ -465,6 +474,27 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await api('/turn',{key:b.key,runId:'w-B4',local:true,prompt:'B恢复后桌面任务'});
   await api('/result',{key:b.key,runId:'w-B4',text:'B4恢复后的结果'});
   await until(()=>pushed('B4恢复后的结果'));
+  // A push from a non-current session holds the next plain message until the user picks a session.
+  await api('/turn',{key:a.key,runId:'w-A3',local:true,prompt:'A桌面任务3'}); await api('/command',{text:'关注'});
+  await api('/result',{key:a.key,runId:'w-A3',text:'A3推送'});
+  await until(()=>pushed('A3推送'));
+  // A later push from the current session keeps earlier pushers in the list.
+  await api('/turn',{key:b.key,runId:'w-B5',local:true,prompt:'B桌面任务5'});
+  await api('/result',{key:b.key,runId:'w-B5',text:'B5推送'});
+  await until(()=>pushed('B5推送'));
+  const held=(await api('/command',{text:'这条本想回A'})).reply.card;
+  assert.equal(held.title,'✉️ 发给哪个会话？'); assert.equal(held.desc,'消息内容：这条本想回A');
+  assert.deepEqual(held.options.map(o=>o.text),['会话B ← 当前','会话A ← 刚推送']);
+  socket.send(JSON.stringify({cmd:'aibot_event_callback',headers:{req_id:`card-${++seq}`},body:{msgid:`card-${seq}`,aibotid:'test-bot',chattype:'single',from:{userid:'owner'},msgtype:'event',event:{eventtype:'template_card_event',template_card_event:{task_id:held.task_id,selected_items:{selected_item:[{question_key:held.task_id,option_ids:{option_id:[held.options[1].id]}}]}}}}}));
+  assert.ok(await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.text==='这条本想回A')));
+  assert.equal((await api('/health')).current,a.key);
+  await api('/turn',{key:a.key,runId:'w-A4',local:false,prompt:'这条本想回A'});
+  await api('/result',{key:a.key,runId:'w-A4',text:'A4选择后结果'});
+  await until(()=>pushed('A4选择后结果'));
+  // Pushes from the current session never hold messages.
+  const goOn=api('/command',{text:'继续A'});
+  assert.ok(await until(async()=>(await api(`/poll?key=${a.key}`)).messages?.find(m=>m.text==='继续A')));
+  await api('/turn',{key:a.key,runId:'w-A5',local:false,prompt:'继续A'}); await api('/result',{key:a.key,runId:'w-A5',text:'A5结果'}); await goOn;
   assert.match((await api('/command',{text:'帮助'})).reply,/\| remote \/ mute \| 关注 \/ 取关 \|/);
   const all=await api('/health'); assert.equal(all.targets.filter(x=>x.kind==='rpc').length,8); // 2 + 2 alias + 3 confirm + 1 default-dir sessions
   assert.equal(all.targets.filter(x=>x.kind==='tui').length,2);
