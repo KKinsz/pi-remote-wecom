@@ -12,7 +12,12 @@ export const BIND_FILE = 'bind.json'; // 待绑定的一次性绑定码
 export const BIND_TTL_MS = 10 * 60 * 1000;
 export const BIND_MAX_FAILURES = 5;
 // 版本唯一来源为 package.json，避免升级后 startService 误判已是新版而跳过重启。
-export const VERSION = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const PACKAGE_JSON = new URL('../package.json', import.meta.url);
+export const VERSION = JSON.parse(fs.readFileSync(PACKAGE_JSON, 'utf8')).version;
+/** 每次现读磁盘：已运行的进程借此发现升级后尚未生效的新版本。 */
+export function diskVersion() {
+  try {return JSON.parse(fs.readFileSync(PACKAGE_JSON, 'utf8')).version || VERSION;} catch {return VERSION;}
+}
 export const DEFAULTS = {
   botId: '', secret: '', ownerUserId: '', localPort: 18778,
   terminal: 'auto', tmuxSession: 'pi', kittySocket: '', dirAliases: {home: '~'}, helpAliases: null,

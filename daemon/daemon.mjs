@@ -9,7 +9,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { loadConfig, statusKeyAllowed, RUN_DIR, VERSION, validateCredentials, ensureToken, saveOwner } from "./config.mjs";
+import { loadConfig, statusKeyAllowed, RUN_DIR, VERSION, diskVersion, validateCredentials, ensureToken, saveOwner } from "./config.mjs";
 import { resolveTerminal } from "./terminals.mjs";
 import { WeComTransport, MAX_ATTACHMENT_BYTES } from "./wecom.mjs";
 import { loadAliases } from "./aliases.mjs";
@@ -29,7 +29,8 @@ const HOST = "127.0.0.1";
 const SYNC_WINDOW_MS = 2000;
 const NAME_WAIT_MS = Number.isFinite(CFG.nameWaitMs) ? CFG.nameWaitMs : 5000;
 const RPC_IDLE_REAP_MS = 2 * 60 * 60000;
-const SILENCE_STEPS_MS = [10 * 60000, 30 * 60000, 60 * 60000];
+const RUN_PING_MS = Array.isArray(CFG.runPingMs) ? CFG.runPingMs : [10 * 60000, 30 * 60000, 60 * 60000];
+const REAP_EVERY_MS = Number.isFinite(CFG.reapIntervalMs) ? CFG.reapIntervalMs : 60000;
 // 终端会话「停止」后多久仍未结束就提醒用户；拒绝中断后留一点时间给在途的 /result。
 const ABORT_ACK_MS = Number.isFinite(CFG.abortAckMs) ? CFG.abortAckMs : 90000;
 const ABORT_REJECT_GRACE_MS = 3000;
@@ -52,7 +53,7 @@ const MODEL_ALL_MAX = 500;
 const UI_POLICY = CFG.remoteConfirm;
 const UI_TIMEOUT_MS = CFG.remoteConfirmTimeoutMs;
 const UI_TEXT_MAX_BYTES = 1200;
-const TUI_STALE_MS = 35000;
+const TUI_STALE_MS = Number.isFinite(CFG.tuiStaleMs) ? CFG.tuiStaleMs : 35000;
 // Keep completed results inline until they approach WeCom's 20,480-byte
 // Markdown limit. The transport sends each message up to the same 20,000-byte
 // safety limit; larger completed results are delivered as Markdown documents.
@@ -132,6 +133,10 @@ function gitBranch(cwd) {
     catch {
         return "";
     }
+}
+function dirLabel(cwd) {
+    const branch = gitBranch(cwd);
+    return ["", "main", "master", "detached"].includes(branch) ? tilde(cwd) : `${tilde(cwd)} (${branch})`;
 }
 function tilde(p) {
     return p === HOME ? "~" : p.startsWith(HOME + "/") ? "~" + p.slice(HOME.length) : p;
@@ -345,8 +350,7 @@ class Run {
         this.startedAt = Date.now();
         this.assistantTexts = [];
         this.toolCalls = 0;
-        this.toolErrors = 0;
-        this.lastTool = "";
+        this.tool = "";
         this.lastOutputAt = Date.now();
         this.error = null;
         this.aborted = null;
@@ -635,13 +639,13 @@ class RpcTarget extends Target {
             case "tool_execution_start":
                 if (r) {
                     r.toolCalls++;
-                    r.lastTool = rec.toolName || "";
+                    r.tool = rec.toolName || "";
                     r.lastOutputAt = Date.now();
                 }
                 break;
             case "tool_execution_end":
-                if (r && rec.isError)
-                    r.toolErrors++;
+                if (r)
+                    r.tool = "";
                 break;
             case "agent_settled":
                 // 轮次结束（含被停止）：回收卡片并按取消回复（Pi 对已结束的请求忽略回复），避免误报"超时已自动允许"。
@@ -1361,12 +1365,10 @@ function footLine(foot) {
     return String(foot).split(" · ").map((seg) => (seg.includes("`") ? seg : "`" + seg + "`")).join(" · ");
 }
 function doneFoot(t, run, stats) {
-    const foot = [`目录：${tilde(t.cwd)}`, `运行：${human((run.endedAt || Date.now()) - run.startedAt)}`];
+    const foot = [`目录：${dirLabel(t.cwd)}`, `运行：${human((run.endedAt || Date.now()) - run.startedAt)}`];
     const context = contextPctLabel(t, stats);
     if (context !== "未知")
         foot.push(`上下文：${context}`);
-    if (run.toolErrors > 0)
-        foot.push(`${run.toolErrors} 失败`);
     if (stats?.cost != null && Number(stats.cost) > 0)
         foot.push(`$${Number(stats.cost).toFixed(4)}`);
     return foot.join(" · ");
@@ -1453,7 +1455,7 @@ function stateCard({ tag, icon, title, desc, emph, emphMax = EMPH_MAX, body = ""
 }
 const runFor = (run) => human((run.endedAt || Date.now()) - run.startedAt);
 function fmtAccepted(t, text = "") {
-    const foot = [`目录：${tilde(t.cwd)}`];
+    const foot = [`目录：${dirLabel(t.cwd)}`];
     if (t.model)
         foot.push(`模型：${t.model}`);
     return plainText({ head: "⏳ 运行中", subject: t.label(), body: (text ? `> ${clipWidth(text, 40)}\n\n\u3000\n\n` : "") + "已送达，完成后推送", foot: foot.join(" · ") });
@@ -1463,7 +1465,7 @@ function fmtFail(t, run) {
         head: "⚠️ 任务失败",
         subject: t.label(),
         body: `错误：${run.error}`,
-        foot: `目录：${tilde(t.cwd)} · 运行：${runFor(run)}`,
+        foot: `目录：${dirLabel(t.cwd)} · 运行：${runFor(run)}`,
     });
 }
 function fmtAborted(t, run) {
@@ -1475,7 +1477,7 @@ function fmtAborted(t, run) {
         body: ended
             ? "终端已空闲，这一轮其实已经结束，但结束消息没能送回。结果请到电脑上查看。"
             : `${why}，这一轮的结果没能送回。电脑上的任务可能已经完成。`,
-        foot: `目录：${tilde(t.cwd)} · 运行：${runFor(run)} · 发送 \`状态\` 查看`,
+        foot: `目录：${dirLabel(t.cwd)} · 运行：${runFor(run)} · 发送 \`状态\` 查看`,
     });
 }
 function fmtNotDelivered(t, error) {
@@ -1483,7 +1485,7 @@ function fmtNotDelivered(t, error) {
         head: "⚠️ 未送达",
         subject: t.label(),
         body: "这条消息没有进入会话，附件已保留。请重发。" + (error ? `\n\n原因：${String(error).slice(0, 60)}` : ""),
-        foot: `目录：${tilde(t.cwd)}`,
+        foot: `目录：${dirLabel(t.cwd)}`,
     });
 }
 async function deliverAndWait(t, text, ack) {
@@ -1545,28 +1547,26 @@ function trackedPush(msg) {
     inflightPushes.add(p);
     return p;
 }
+const toolLabel = (name) => (name === "Agent" ? "等待 subagent" : name);
 function watchAsync(t, run) {
     if (run.watched)
         return;
     run.watched = true;
     let sent = 0;
     const prog = setInterval(() => {
-        if (run.settled || sent >= SILENCE_STEPS_MS.length)
+        if (run.settled || sent >= RUN_PING_MS.length)
             return clearInterval(prog);
         if (run.stopped || run.stopRequestedAt || run.muted)
             return;
-        const silent = Date.now() - run.lastOutputAt;
-        if (silent < SILENCE_STEPS_MS[sent])
+        const ran = Date.now() - run.startedAt;
+        if (ran < RUN_PING_MS[sent])
             return;
-        const ms = SILENCE_STEPS_MS[sent];
-        const step = ms % 3600000 === 0 ? `${ms / 3600000} 小时` : `${Math.round(ms / 60000)} 分钟`;
-        sent++;
-        const ran = `已运行 ${human(Date.now() - run.startedAt)}`;
-        const body = sent >= SILENCE_STEPS_MS.length
-            ? `${ran}，连续 ${step} 没有动作，可能卡住了，之后不再提醒。`
-            : `${ran}，${step} 没有新动作${run.lastTool ? `，最后一个动作是 ${run.lastTool}` : ""}。`;
+        // 关注接管的任务可能早已跑过好几档：只推一条，跳过已过的档位。
+        while (sent < RUN_PING_MS.length && ran >= RUN_PING_MS[sent])
+            sent++;
+        const body = `已运行 ${human(ran)}，仍在运行中。` + (run.tool ? `\n\n当前动作：${toolLabel(run.tool)}` : "");
         sendText(plainText({ head: "⏳ 运行中", subject: t.label(), body, foot: "发送 `状态` 查看详情，或 `停止` 停止" }));
-    }, 30000);
+    }, Math.min(30000, RUN_PING_MS[0] || 30000));
     run.wait().then(async () => {
         clearInterval(prog);
         if (run.superseded)
@@ -1751,12 +1751,10 @@ const helpText = () => [
     "|---|---|",
     "| n | 创建会话 |",
     "| ls | 活跃会话 |",
-    "| h | 历史会话 |",
+    "| remote / mute | 关注 / 取关 |",
     "| model | 模型 |",
     "| think | 思考强度 |",
-    "| remote / mute | 关注 / 取关 |",
     "| cd | 目录 |",
-    "| art | 产物 |",
     "| compact | 压缩 |",
     "| status | 状态 |",
     "| stop | 停止 |",
@@ -1986,10 +1984,11 @@ async function buildThinkCard(t, arg = "") {
         id: registerPick({ act: "think", targetKey: t.key, sessionId: t.sessionId, level: l }),
         text: [thinkLabel(l), l === current ? "← 当前" : ""].filter(Boolean).join(" · "),
     }));
+    const sample = levels.find((l) => l !== current && l !== "off") || levels.find((l) => l !== current) || levels[0];
     const card = {
         card_type: "vote_interaction",
         title: clip(`🧠 切换思考强度 · ${t.label()}`, 26),
-        desc: clip(`模型 ${t.model || "未知"} · 当前 ${current || "未知"}`, 30),
+        desc: clip(`当前 ${current || "未知"} · 发「思考强度 ${sample}」直接切换`, 30),
         options,
         mode: 0,
         submit_text: "切换思考强度",
@@ -1999,7 +1998,7 @@ async function buildThinkCard(t, arg = "") {
         head: "⚠️ 卡片发送失败",
         subject: "切换思考强度",
         body: levels.map((l) => `${thinkLabel(l)}${l === current ? " · ← 当前" : ""}`).join("\n"),
-        foot: "发送 `思考强度 high` 直接切换",
+        foot: `发送 \`思考强度 ${sample}\` 直接切换`,
     }));
 }
 const fmtTok = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : String(n));
@@ -2114,7 +2113,7 @@ function remoteAll() {
     }
     const cur = currentTarget();
     if (!rows.length) {
-        return plainText({ head: "📌 关注", body: "没有运行中的终端会话。", foot: cur ? `当前会话：${cur.label()}` : "发送 `活跃会话` 选择" });
+        return plainText({ head: "📌 关注", body: "没有运行中的终端会话。", foot: "发送 `活跃会话` 选择" });
     }
     const lines = rows.map((t) => {
         const r = pendingRun(t);
@@ -2122,31 +2121,32 @@ function remoteAll() {
         if (hasParkedUi(t))
             bits.push("等你回答");
         if (t === cur)
-            bits.push("当前");
+            bits.push("← 当前");
         return `- ${bits.join(" · ")}`;
     });
     return plainText({
-        head: `📌 已关注 ${rows.length} 个运行中会话`,
+        head: `📌 已关注 · ${rows.length} 个运行中会话`,
         body: lines.join("\n"),
-        foot: [cur ? `当前会话：${cur.label()}` : "", "引用消息，回复会发给相应会话"].filter(Boolean).join(" · "),
+        foot: "引用消息，回复会发给相应会话",
     });
 }
 /** 「取关」：电脑上发起的轮次（含在跑的）不再推送，手机发起的不受影响。 */
 function muteAll() {
     muted = true;
-    let n = 0;
+    const lines = [];
     for (const t of targets.values()) {
-        for (const r of inflightRuns(t)) {
-            if (r.local && r.watched && !r.muted) {
-                r.muted = true;
-                n++;
-            }
-        }
+        const runs = inflightRuns(t).filter((r) => r.local && r.watched);
+        if (!runs.length)
+            continue;
+        for (const r of runs)
+            r.muted = true;
+        lines.push(`- ${t.label()} · 已运行 ${human(Date.now() - Math.min(...runs.map((r) => r.startedAt)))}`);
     }
-    log(`mute runs=${n}`);
+    log(`mute sessions=${lines.length}`);
+    const note = "电脑上发起的任务不再推送，手机发起的照常推送。";
     return plainText({
-        head: "🔕 已取关",
-        body: `电脑上发起的任务不再推送${n ? `，运行中的 ${n} 个也不再回传` : ""}。手机发起的任务照常推送。`,
+        head: lines.length ? `🔕 已取关 · ${lines.length} 个运行中会话` : "🔕 已取关",
+        body: lines.length ? `${lines.join("\n")}\n\n${note}` : note,
         foot: "发送 `关注` 恢复",
     });
 }
@@ -2372,9 +2372,8 @@ async function footerInfo(t) {
             t.contextWindow = s.contextWindow;
     }
     const stats = t.kind === "rpc" ? s : null;
-    const branch = gitBranch(t.cwd);
     const lines = [
-        `目录：${tilde(t.cwd)}${branch ? ` (${branch})` : ""}`,
+        `目录：${dirLabel(t.cwd)}`,
         `模型：${t.model || "未知"}${t.thinkingLevel ? ` · ${t.thinkingLevel}` : ""}`,
         `上下文：${contextLabel(t, stats)}${t.cost > 0 ? ` · 花费 $${t.cost.toFixed(3)}` : ""}`,
     ];
@@ -2398,18 +2397,22 @@ async function statusCard() {
         return plainText({
             head: "⏳ 运行中",
             subject: t.label(),
-            body: `已运行 ${human(Date.now() - r.startedAt)}${r.lastTool ? `，当前在跑 ${r.lastTool}` : ""}。${stopping}\n\n${info}`,
-            foot: [`类型：${kind}`, ...tunnel, ...mutedFoot(), "发送 `停止` 停止"].join(" · "),
+            body: `已运行 ${human(Date.now() - r.startedAt)}${r.tool ? `，当前动作：${toolLabel(r.tool)}` : ""}。${stopping}\n\n${info}`,
+            foot: [`类型：${kind}`, ...tunnel, ...mutedFoot(), ...updateFoot(), "发送 `停止` 停止"].join(" · "),
         });
     }
     return plainText({
         head: "🧊 空闲",
         subject: t.label(),
         body: `等你发消息，上次活动 ${ago(t.lastActivity)}。\n\n${info}`,
-        foot: [`类型：${kind}`, ...tunnel, ...mutedFoot()].join(" · "),
+        foot: [`类型：${kind}`, ...tunnel, ...mutedFoot(), ...updateFoot()].join(" · "),
     });
 }
 const mutedFoot = () => (muted ? ["已取关：电脑任务不推送"] : []);
+const updateFoot = () => {
+    const next = diskVersion();
+    return next !== VERSION ? [`新版本 v${next}，发送 \`重启\` 生效`] : [];
+};
 // ---- 默认目录：只影响之后新建的会话（`创建会话` 不带目录时），已有会话不动 ----
 const DEFAULT_DIR_FILE = path.join(DIR, ".default-dir");
 function defaultDir() {
@@ -2444,10 +2447,10 @@ function applyDefaultDir(d, via = "") {
         tag: "cwd",
         icon: "📁",
         title: "切换目录",
-        desc: "之后新建会话默认在此目录，已有会话不受影响",
+        desc: "发「创建会话 目录别名 消息」，指定目录",
         emph: { title: via || path.basename(d) || "~", desc: tilde(d) },
         emphMax: EMPH_NAME_MAX,
-        fallback: () => plainText({ head: "📁 已切换目录", subject: tilde(d), body: "之后新建会话默认在此目录，已有会话不受影响", foot: "发送 `创建会话` 在此目录新建" }),
+        fallback: () => plainText({ head: "📁 已切换目录", subject: tilde(d), body: "之后新建会话默认在此目录，已有会话不受影响", foot: "发送 `创建会话 目录别名 消息`，指定目录" }),
     });
 }
 function buildDirCard(arg) {
@@ -2478,7 +2481,7 @@ function buildDirCard(arg) {
     const card = {
         card_type: "vote_interaction",
         title: clip("📁 切换目录", 26),
-        desc: clip(`当前 ${tilde(cur)} · 只影响新建会话`, 30),
+        desc: "未配置别名的目录，可发「目录 ~/路径」",
         options,
         mode: 0,
         submit_text: "切换目录",
@@ -2673,7 +2676,7 @@ async function finishCreate(t, msg, media, ack, note = "") {
             log(`创建会话 等会话名 ${t.name ? `命中 ${Date.now() - t0}ms` : `超时 ${NAME_WAIT_MS}ms，用首条截断`}`);
         }
     }
-    const foot = [`目录：${tilde(t.cwd)}`, `类型：${kindOf(t)}`];
+    const foot = [`目录：${dirLabel(t.cwd)}`, `类型：${kindOf(t)}`];
     if (r?.notDelivered) {
         return plainText({
             head: "⚠️ 首条未送达",
@@ -2767,7 +2770,7 @@ async function newTerminalTab(cwd, msg, media, ack) {
         return plainText({
             head: "⚠️ 标签页未就绪",
             body: `标签页已经打开，但 ${Math.round(NEW_TAB_WAIT_MS / 1000)} 秒内没等到 pi 注册上来。`,
-            foot: `目录：${tilde(cwd)} · 稍后发送 \`活跃会话\` 查看 · 发送 \`创建后台会话\` 改用后台`,
+            foot: `目录：${dirLabel(cwd)} · 稍后发送 \`活跃会话\` 查看 · 发送 \`创建后台会话\` 改用后台`,
         });
     }
     return finishCreate(t, msg, media, ack);
@@ -2823,14 +2826,14 @@ function buildCreatedCard(t, note = "") {
     const text = () => plainText({
         head: "✏️ 会话已创建",
         subject: name,
-        foot: [`目录：${tilde(t.cwd)}`, `类型：${kindOf(t)}`, `模型：${t.model || "未知"}`, note, t.busy ? "" : "发送 `创建会话 消息` 直接完成"].filter(Boolean).join(" · "),
+        foot: [`目录：${dirLabel(t.cwd)}`, `类型：${kindOf(t)}`, `模型：${t.model || "未知"}`, note, t.busy ? "" : "发送 `创建会话 目录别名 消息`，指定目录"].filter(Boolean).join(" · "),
     });
     return stateCard({
         tag: "created",
         lead: `**✏️ 已创建 ${clip(name, 20)}**`,
         icon: "✏️",
         title: "创建会话",
-        desc: t.busy ? "任务已开始，完成后推送结果" : "已创建 · 发 「创建会话 消息」直接完成",
+        desc: t.busy ? "任务已开始，完成后推送结果" : "发「创建会话 目录别名 消息」，指定目录",
         body: note,
         emph: { title: name },
         emphMax: EMPH_NAME_MAX,
@@ -3048,22 +3051,26 @@ function restartDaemon(rest) {
     setTimeout(() => process.kill(process.pid, "SIGTERM"), 1500).unref?.();
     return plainText({ head: "🔄 正在重启", body: "约 10 秒后自动重连，连上后会收到一条确认。", foot: "终端会话会自动重连" });
 }
-const RUN_STUCK_MS = SILENCE_STEPS_MS[SILENCE_STEPS_MS.length - 1] + 30 * 60000;
+// 只按连接判失联：委派 subagent、长命令期间扩展没有心跳，按静默时长判会误杀正常任务。
+let reapedAt = Date.now();
 setInterval(() => {
-    const now = Date.now();
+    // 电脑睡眠唤醒后扩展还没来得及重新轮询，跳过这一轮。
+    const suspended = Date.now() - reapedAt > 2 * REAP_EVERY_MS;
+    reapedAt = Date.now();
     for (const t of [...targets.values()]) {
+        const lost = !suspended && (t.kind === "tui" ? !t.alive : t.closed);
         const runs = [...(t.loops?.values?.() || [])];
         if (t.run && !runs.includes(t.run))
             runs.push(t.run);
         for (const r of runs) {
             if (r.settled)
                 continue;
-            if (now - Math.max(r.lastOutputAt, r.startedAt) < RUN_STUCK_MS)
+            if (!lost)
                 continue;
             r.aborted = "会话失联";
             r.settle();
             t.noteSettled?.(r);
-            log(`reap stuck run target=${t.key} id=${r.id} idle=${human(now - r.lastOutputAt)}`);
+            log(`reap lost run target=${t.key} id=${r.id} idle=${human(Date.now() - r.lastOutputAt)}`);
         }
         if (t.loops && t.loops.size > 8) {
             for (const [k, r] of t.loops) {
@@ -3072,7 +3079,7 @@ setInterval(() => {
             }
         }
     }
-}, 5 * 60000).unref?.();
+}, REAP_EVERY_MS).unref?.();
 setInterval(() => {
     const now = Date.now();
     for (const t of [...targets.values()]) {
@@ -3267,6 +3274,8 @@ async function handleHttp(req, res) {
         if (!run || run.settled)
             return json(res, 200, { ok: true, stale: true });
         run.lastOutputAt = Date.now();
+        if (typeof o.tool === "string")
+            run.tool = o.tool.slice(0, 80);
         return json(res, 200, { ok: true });
     }
     if (p === "/abort-ack" && req.method === "POST") {

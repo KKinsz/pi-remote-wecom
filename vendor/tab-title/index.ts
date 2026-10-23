@@ -55,6 +55,18 @@ function readNamingModel(): NamingModel {
   return { provider: data.provider, model: data.model };
 }
 
+type TitleModel = { reasoning?: boolean; thinkingLevelMap?: Partial<Record<string, string | null>> };
+
+/**
+ * 不传 reasoningEffort 时，推理模型可能按服务端默认档位思考，思考内容也占输出上限；
+ * 按最低可用档位放宽，免得只有高档思考的模型被截断成空标题。null 表示不支持该档位。
+ */
+export function titleMaxTokens(model: TitleModel): number {
+  if (!model.reasoning) return 1024;
+  const light = ["off", "minimal", "low"].some((level) => model.thinkingLevelMap?.[level] !== null);
+  return light ? 1024 : 2048;
+}
+
 /** Whether automatic naming is armed for new sessions (a naming model has been chosen). */
 export function namingEnabled(): boolean {
   try {
@@ -251,7 +263,7 @@ export default function (pi: ExtensionAPI) {
         ],
       },
       {
-        maxTokens: 256,
+        maxTokens: titleMaxTokens(model),
         // Thinking off: omit reasoningEffort. Measured on tencent-copilot deepseek-v4.1-flash:
         // "low" took 5-6s and often exhausted tokens with empty output; omitted ≈1s.
         cacheRetention: "none",

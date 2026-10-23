@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import extension,{namingEnabled} from '../vendor/tab-title/index.ts';
+import extension,{namingEnabled,titleMaxTokens} from '../vendor/tab-title/index.ts';
 import {isolateConfig} from './isolated-config.mjs';
 const agentDir=isolateConfig();
 test('新用户未选命名模型不发请求，手动命名照常工作',async()=>{
@@ -18,4 +18,11 @@ test('未选命名模型时 namingEnabled 为 false，选定后为 true',async()
  fs.writeFileSync(file,JSON.stringify({version:1,provider:'p',model:'m'}));assert.equal(namingEnabled(),true);
  fs.writeFileSync(file,'{bad');assert.equal(namingEnabled(),false);
  fs.rmSync(file,{force:true});
+});
+test('命名输出上限按模型最低可用思考档位放宽',()=>{
+ assert.equal(titleMaxTokens({reasoning:false}),1024);
+ assert.equal(titleMaxTokens({reasoning:true}),1024);
+ assert.equal(titleMaxTokens({reasoning:true,thinkingLevelMap:{off:null,minimal:null,low:'low',medium:null,high:'high'}}),1024);
+ assert.equal(titleMaxTokens({reasoning:true,thinkingLevelMap:{off:null,minimal:null,low:null}}),2048);
+ assert.equal(titleMaxTokens({reasoning:true,thinkingLevelMap:{off:null,minimal:null,low:null,medium:null,high:'high'}}),2048);
 });

@@ -427,8 +427,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   assert.equal((await api('/turn',{key:a.key,runId:'w-A1',local:true,prompt:'A桌面任务'})).tracked,false);
   assert.equal((await api('/turn',{key:b.key,runId:'w-B1',local:true,prompt:'B桌面任务'})).tracked,false);
   const watched=(await api('/command',{text:'关注'})).reply;
-  assert.match(watched,/已关注 2 个运行中会话/); assert.match(watched,/- 会话A · 已运行/); assert.match(watched,/- 会话B · 已运行/);
-  assert.match((await api('/command',{text:'remote'})).reply,/已关注 2 个/);
+  assert.match(watched,/已关注 · 2 个运行中会话/); assert.match(watched,/- 会话A · 已运行/); assert.match(watched,/- 会话B · 已运行/); assert.doesNotMatch(watched,/当前会话：/);
+  assert.match((await api('/command',{text:'remote'})).reply,/已关注 · 2 个/);
   assert.equal((await api('/ui-request',{key:b.key,reqId:'w-ui',kind:'confirm',title:'确认B'})).parked,true);
   await api('/ui-request',{key:b.key,reqId:'w-ui-2',kind:'confirm',title:'确认B2'});
   await until(()=>pushed('等你回答 · 会话B'));
@@ -452,7 +452,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   await until(()=>sent.some(x=>x.template_card?.main_title?.title?.includes('确认B')));
   await api('/ui-done',{key:b.key,reqId:'w-ui'}); await api('/ui-done',{key:b.key,reqId:'w-ui-2'});
   const muteReply=(await api('/command',{text:'取关'})).reply;
-  assert.match(muteReply,/已取关[\s\S]*运行中的 1 个也不再回传[\s\S]*手机发起的任务照常推送/);
+  assert.match(muteReply,/已取关 · 1 个运行中会话[\s\S]*- 会话B · 已运行[\s\S]*手机发起的照常推送/); assert.doesNotMatch(muteReply,/会话A/);
   for (const word of ['静音','取消关注','mute']) assert.match((await api('/command',{text:word})).reply,/已取关/);
   await api('/result',{key:b.key,runId:'w-B1',text:'B1取关后的结果'});
   await api('/turn',{key:b.key,runId:'w-B2',local:true,prompt:'B取关后桌面任务'});
@@ -557,4 +557,46 @@ test('真实 daemon：手机「重启」命令走优雅退出并在重新拉起�
   sendText('r2','帮助');
   await until(()=>sent.some(b=>b.markdown?.content?.includes('命令表')));
   assert.equal(sent.filter(b=>b.markdown?.content?.includes('已重启')).length, afterNotice);
+});
+
+test('真实 daemon：运行中提醒带当前动作，连接在时不按静默回收，断开后判失联', {timeout: 30000}, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-wecom-reap-'));
+  const port = await freePort();
+  const server = new WebSocketServer({host:'127.0.0.1',port:0});
+  await new Promise(r=>server.on('listening',r));
+  let socket; const sent = [];
+  server.on('connection', ws => {socket = ws; ws.on('message', data => {
+    const frame = JSON.parse(String(data));
+    if (frame.cmd === 'aibot_send_msg') sent.push(frame.body);
+    ws.send(JSON.stringify({headers:frame.headers,errcode:0,errmsg:'ok'}));
+  });});
+  fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({botId:'test-bot',secret:'test-secret',ownerUserId:'owner',localPort:port,
+    wsUrl:`ws://127.0.0.1:${server.address().port}`,agentDir:path.join(dir,'agent'),terminal:'none',inboxDir:path.join(dir,'inbox'),
+    runPingMs:[1200],reapIntervalMs:300,tuiStaleMs:1500}));
+  fs.writeFileSync(path.join(dir,'.token'),'local-token');
+  const child = spawn(process.execPath,['daemon/daemon.mjs'],{cwd:process.cwd(),env:{...process.env,PI_REMOTE_HOME:dir},stdio:['ignore','pipe','pipe']});
+  let errors = ''; child.stderr.on('data',d=>errors+=d);
+  t.after(async () => {
+    child.kill('SIGKILL');
+    for (const client of server.clients) client.terminate(); await new Promise(r=>server.close(r));
+    fs.rmSync(dir,{recursive:true,force:true});
+  });
+  const api = async (url, body) => (await fetch(`http://127.0.0.1:${port}${url}`,{method:body?'POST':'GET',
+    headers:{'x-pi-token':'local-token','content-type':'application/json'},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(4000)})).json();
+  await until(async()=>{try {return (await api('/health')).connected;} catch {if (child.exitCode !== null) throw Error(errors); return false;}});
+  const reg = {mode:'tui',sessionId:'S',sessionName:'长任务',cwd:dir};
+  const {key} = await api('/register',reg);
+  await api('/turn',{key,runId:'run-long',local:true,prompt:'委派 subagent'});
+  await api('/command',{text:'关注'});
+  await api('/activity',{key,runId:'run-long',tool:'Agent'});
+  const text = () => sent.map(b=>b.markdown?.content || b.text?.content || '').join('\n---\n');
+  // 连接一直在（持续注册刷新轮询时间），没有任何输出也不回收。
+  const keepAlive = setInterval(()=>{api('/register',reg).catch(()=>{});},300);
+  try {
+    await until(()=>text().includes('当前动作：等待 subagent'), 5000);
+    await delay(2500);
+  } finally {clearInterval(keepAlive);}
+  assert.doesNotMatch(text(), /会话失联/);
+  // 停止轮询：超过失联阈值后按「会话失联」收尾并推送。
+  await until(()=>text().includes('会话失联'), 6000);
 });

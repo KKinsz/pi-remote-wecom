@@ -2,13 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import type {ExtensionAPI, ExtensionCommandContext, ExtensionContext} from '@earendil-works/pi-coding-agent';
-import {RUN_DIR, loadConfig, statusKeyAllowed} from '../daemon/config.mjs';
+import {RUN_DIR, diskVersion, loadConfig, statusKeyAllowed} from '../daemon/config.mjs';
 type Json = Record<string, any>;
 type Runtime = {
   ctx: ExtensionContext; cancelled: boolean; cancel: AbortController;
   key: string | null; token: string; port: number; statusKey: string;
   runId: string | null; text: string; toolCalls: number; queued: number;
-  stopped: boolean; error: string; lastBeat: number;
+  stopped: boolean; error: string; lastBeat: number; sentTool: string; toolTimer?: ReturnType<typeof setTimeout>;
   phone: boolean; uiWaits: Map<string, (answer: Json) => void>; uiReqs: Map<string, Json>;
   asking: Asking[]; tools: Map<string, string>;
   /** 打开的是后台仍在运行的会话：等它结束后再交给终端。 */
@@ -138,6 +138,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   let active: Runtime | undefined;
   /** 自动刷新完成后在新会话里提示的文案；空则不提示。 */
   let reloadNotice = '';
+  let updateNoticePid = 0;
   // 其他扩展写进 footer 的状态项（每人不同）：从 ui.setStatus 截获，状态卡片按需上报。
   const extStatuses = new Map<string, string>();
   function footerInfo(r: Runtime) {
@@ -322,6 +323,14 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
       Object.defineProperty(ui, UI_PATCHED, {value: true});
     } catch {/* 只读或结构变化：保持原样，终端弹窗照常可用 */}
   }
+  /** 运行中的 daemon 落后于磁盘版本时提醒一次（按 daemon pid 去重）。 */
+  async function noticeUpdate(r: Runtime) {
+    const h = await call(r, '/health');
+    const next = diskVersion();
+    if (r.cancelled || !h?.version || h.version === next || h.pid === updateNoticePid) return;
+    updateNoticePid = Number(h.pid);
+    r.ctx.ui.notify(`Pi Remote 有新版本 v${next}，空闲时执行 /remote restart 生效`, 'warning');
+  }
   async function call(r: Runtime, endpoint: string, body?: Json, timeout = 3000): Promise<Json | null> {
     try {
       const response = await fetch(`http://127.0.0.1:${r.port}${endpoint}`, {
@@ -373,7 +382,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     const cfg = loadConfig();
     const r: Runtime = {ctx, cancelled: false, cancel: new AbortController(), key: null,
       token: '', port: cfg.localPort, statusKey: cfg.statusKey, runId: null, text: '',
-      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: [], tools: new Map(),
+      toolCalls: 0, queued: 0, stopped: false, error: '', lastBeat: 0, sentTool: '', phone: false, uiWaits: new Map(), uiReqs: new Map(), asking: [], tools: new Map(),
       waiting: false};
     active = r;
     extStatuses.clear(); // 新会话/重载时 Pi 已清空 footer 状态
@@ -401,6 +410,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
           }
           if (!registered?.key) {status(r, '服务未启动 · /remote restart', 'red'); await delay(r, 3000); continue;}
           r.key = registered.key;
+          void noticeUpdate(r);
           if (r.waiting || (registered.handedOff && diskAhead(ctx))) {
             // 画面是后台跑完之前的快照：重新载入会话文件。只有命令能切换会话，从这里触发内部命令。
             reloadNotice = r.waiting ? HANDOFF_TEXT.done : '';
@@ -515,14 +525,25 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
   });
   pi.on('before_agent_start', async (event) => {
     const r = active; if (!r) return;
-    r.runId = randomUUID(); r.text = ''; r.toolCalls = 0; r.stopped = false; r.error = ''; r.lastBeat = 0;
+    r.runId = randomUUID(); r.text = ''; r.toolCalls = 0; r.stopped = false; r.error = ''; r.lastBeat = 0; r.sentTool = '';
     const local = r.queued === 0; r.queued = 0; r.phone = !local;
     if (r.key) await call(r, '/turn', {key: r.key, runId: r.runId, prompt: String(event.prompt ?? '').slice(0, 200), local});
   });
+  const currentTool = (r: Runtime) => [...r.tools.values()].pop() || '';
+  const report = (r: Runtime) => {
+    r.lastBeat = Date.now(); r.sentTool = currentTool(r);
+    void call(r, '/activity', {key: r.key, runId: r.runId, tool: r.sentTool});
+  };
+  // 工具切换稍等再报：短工具连续调用时只报停留下来的那个。
   const beat = () => {
     const r = active;
-    if (!r?.key || !r.runId || Date.now() - r.lastBeat < 15000) return;
-    r.lastBeat = Date.now(); void call(r, '/activity', {key: r.key, runId: r.runId});
+    if (!r?.key || !r.runId) return;
+    if (Date.now() - r.lastBeat >= 15000) return report(r);
+    if (r.toolTimer || currentTool(r) === r.sentTool) return;
+    r.toolTimer = setTimeout(() => {
+      r.toolTimer = undefined;
+      if (active === r && r.key && r.runId && currentTool(r) !== r.sentTool) report(r);
+    }, 3000);
   };
   pi.on('tool_execution_start', (event) => {
     if (active) {
@@ -537,6 +558,7 @@ export default function remote(pi: ExtensionAPI, opts: {autoName?: () => boolean
     if (!active) return;
     active.asking = active.asking.filter(a => a.toolCallId !== event?.toolCallId);
     active.tools.delete(event?.toolCallId);
+    beat();
   });
   pi.on('message_end', (event) => {
     const r = active; if (!r || event.message.role !== 'assistant') return;

@@ -5,7 +5,7 @@ import {getAgentDir} from '@earendil-works/pi-coding-agent';
 import remote from './remote.ts';
 import {aliasCommand, aliasCompletions} from './alias.ts';
 import tabTitle, {namingEnabled} from '../vendor/tab-title/index.ts';
-import {RUN_DIR, WELCOME_FILE, BIND_FILE, BIND_TTL_MS, loadConfig, saveConfig, createBindCode} from '../daemon/config.mjs';
+import {RUN_DIR, WELCOME_FILE, BIND_FILE, BIND_TTL_MS, diskVersion, loadConfig, saveConfig, createBindCode} from '../daemon/config.mjs';
 import {health, startService, stopService, restartService} from '../daemon/service.mjs';
 
 const SUBCOMMANDS: [string, string][] = [
@@ -42,7 +42,10 @@ async function watchBinding(ctx: any, deadline: number) {
   ctx.ui.notify('绑定码已过期，执行 /remote bind 重新获取。', 'warning');
 }
 function summary(state: any) {
-  return state ? `${state.reason} · 活跃会话 ${state.targets.length} · v${state.version}` : '后台服务未运行';
+  if (!state) return '后台服务未运行';
+  const next = diskVersion();
+  const update = state.version !== next ? `（新版本 v${next}，需 /remote restart 生效）` : '';
+  return `${state.reason} · 活跃会话 ${state.targets.length} · v${state.version}${update}`;
 }
 
 export default function (pi: ExtensionAPI) {
